@@ -1,0 +1,257 @@
+"""
+EventLogger — structured writer for observation events into the events
+Delta table.
+
+Writes non-fatal, informational events during processing (coding, MI_fix,
+edit, imputation, validation). Unlike ExceptionLogger, there's no registry
+— event_type and rule_name are free-text strings provided by the caller.
+
+Inherits from BaseLogger for buffering, flushing, context-manager lifecycle,
+and table-contract validation.
+
+Caller-facing surface (intentionally tiny):
+
+    from utils.logger import EventLogger
+
+    with EventLogger.for_task(
+        spark=spark,
+        collection_instance_id="2027-CAS-001",
+        source_table="socpophousdata1_dev.social_census_parsed.individual",
+        target_table="socpophousdata1_dev.social_census_classified.individual",
+    ) as logger:
+        logger.log_event(
+            event_type="coding",
+            message="Applied ethnic group coding rules successfully",
+            rule_name="ethnic_group_coding_v1",
+            response_id="P12345",
+            variable_name="ethnic_group",
+        )
+"""
+
+from __future__ import annotations
+
+import os
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+from pyspark.sql import SparkSession
+from pyspark.sql.types import (
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
+
+from utils.logger.base_logger import BaseLogger
+from utils.logger.context import RunContext, build_run_context
+
+
+# Default events Delta table. Override per-task via the ``log_table_path``
+# argument to for_task(), or globally via the environment variable below.
+# Higher default batch size than ExceptionLogger (events are more numerous
+# per task; buffering more keeps write overhead proportional).
+_LOG_TABLE_ENV_VAR = "CENSUS_EVENT_LOG_TABLE"
+_DEFAULT_LOG_TABLE = "socpophousdata1_dev.social_census_logs.events"
+
+_DEFAULT_BATCH_SIZE = 1000
+
+
+class EventLogger(BaseLogger):
+    """
+    Buffered writer for the ``social_census_logs.events`` Delta table.
+
+    Not thread-safe. One instance per task — construct via
+    :meth:`EventLogger.for_task`.
+    """
+
+    # Schema mirrors the spec's events table. Shares most columns with
+    # ExceptionLogger but lacks the governance fields (validation_level,
+    # error_code, severity, is_blocking, stack_trace) and has a free-text
+    # ``rule_name`` in their place.
+    _SCHEMA: StructType = StructType([
+        StructField("observation_id", StringType(), False),
+        StructField("run_id", StringType(), False),
+        StructField("job_id", StringType(), True),
+        StructField("task_key", StringType(), False),
+        StructField("source_table", StringType(), True),
+        StructField("target_table", StringType(), True),
+        StructField("event_type", StringType(), False),
+        StructField("rule_name", StringType(), True),
+        StructField("message", StringType(), True),
+        StructField("response_id", StringType(), True),
+        StructField("collection_instance_id", StringType(), True),
+        StructField("variable_name", StringType(), True),
+        StructField("created_timestamp_utc", TimestampType(), False),
+    ])
+
+    @property
+    def _schema(self) -> StructType:
+        return self._SCHEMA
+
+    # ────────────────────────────────────────────────────────
+    # Constructor
+    # ────────────────────────────────────────────────────────
+
+    def __init__(
+        self,
+        spark: SparkSession,
+        context: RunContext,
+        table_path: str,
+        batch_size: int = _DEFAULT_BATCH_SIZE,
+    ):
+        """
+        Construct an EventLogger.
+
+        Most callers should use :meth:`for_task` instead — it wires up
+        the context and default table path automatically.
+
+        Args:
+            spark: Active SparkSession.
+            context: RunContext — run_id, task_key, source_table, etc.
+            table_path: Fully-qualified events Delta table.
+            batch_size: Records to buffer before auto-flush.
+        """
+        # Delegate buffering, flushing, context-manager, and table-contract
+        # validation to the base. EventLogger has no registry or other
+        # subclass-specific state, so there's nothing to add after the
+        # super() call.
+        super().__init__(
+            spark=spark,
+            context=context,
+            table_path=table_path,
+            batch_size=batch_size,
+        )
+
+    # ────────────────────────────────────────────────────────
+    # Factory
+    # ────────────────────────────────────────────────────────
+
+    @classmethod
+    def for_task(
+        cls,
+        spark: SparkSession,
+        *,
+        collection_instance_id: str,
+        task_key: Optional[str] = None,
+        source_table: Optional[str] = None,
+        target_table: Optional[str] = None,
+        log_table_path: Optional[str] = None,
+        batch_size: int = _DEFAULT_BATCH_SIZE,
+    ) -> "EventLogger":
+        """
+        Build a fully-configured EventLogger for a single task.
+
+        Mirrors :meth:`ExceptionLogger.for_task`. The resulting logger is
+        a context manager — use it inside a ``with`` block.
+
+        Args:
+            spark: Active SparkSession.
+            collection_instance_id: Sub-operation the data relates to
+                (e.g. ``"2027-CAS-001"``).
+            task_key: Optional override for the task key. Defaults to
+                the Databricks Job task_key; falls back to "unknown".
+            source_table: Fully-qualified upstream table, if any.
+            target_table: Fully-qualified downstream table, if any.
+            log_table_path: Override for the events Delta table.
+                Falls back to ``$CENSUS_EVENT_LOG_TABLE`` env var, then
+                to the project default.
+            batch_size: Records to buffer before auto-flush.
+        """
+        context = build_run_context(
+            collection_instance_id=collection_instance_id,
+            task_key=task_key,
+            source_table=source_table,
+            target_table=target_table,
+        )
+
+        resolved_table = (
+            log_table_path
+            or os.environ.get(_LOG_TABLE_ENV_VAR)
+            or _DEFAULT_LOG_TABLE
+        )
+
+        return cls(
+            spark=spark,
+            context=context,
+            table_path=resolved_table,
+            batch_size=batch_size,
+        )
+
+    # ────────────────────────────────────────────────────────
+    # Public API
+    # ────────────────────────────────────────────────────────
+
+    def log_event(
+        self,
+        *,
+        event_type: str,
+        message: str,
+        rule_name: Optional[str] = None,
+        response_id: Optional[str] = None,
+        variable_name: Optional[str] = None,
+        observation_id: Optional[str] = None,
+        created_timestamp_utc: Optional[datetime] = None,
+    ) -> None:
+        """
+        Log one observation event.
+
+        Keyword-only — too many fields for positional to stay readable,
+        and kwargs guard against silent reordering.
+
+        Args:
+            event_type: Event category — e.g. ``"coding"``, ``"MI_fix"``,
+                ``"edit"``, ``"imputation"``, ``"validation"``.
+            message: Human-readable description of the event.
+            rule_name: Specific business rule name for the event.
+                Free text (unlike ExceptionLogger's ``rule`` which must
+                exist in the registry).
+            response_id: Primary key of the row being observed, if any.
+            variable_name: The name of the variable being processed.
+            observation_id: Override for the auto-generated observation_id.
+                Useful when the event corresponds to a known upstream ID.
+            created_timestamp_utc: Override for the auto-generated timestamp.
+                Useful for backfilling events with their original time.
+        """
+        record = self._build_record(
+            event_type=event_type,
+            message=message,
+            rule_name=rule_name,
+            response_id=response_id,
+            variable_name=variable_name,
+            observation_id=observation_id,
+            created_timestamp_utc=created_timestamp_utc,
+        )
+        self._add_to_buffer(record)
+
+    # ────────────────────────────────────────────────────────
+    # Internal — record assembly
+    # ────────────────────────────────────────────────────────
+
+    def _build_record(
+        self,
+        *,
+        event_type: str,
+        message: str,
+        rule_name: Optional[str],
+        response_id: Optional[str],
+        variable_name: Optional[str],
+        observation_id: Optional[str],
+        created_timestamp_utc: Optional[datetime],
+    ) -> dict:
+        """
+        Assemble one Delta-ready record dict. Pure function — no side effects.
+
+        Uses ``self._context_fields()`` (from BaseLogger) for the context
+        columns, then adds event-specific fields on top.
+        """
+        return {
+            **self._context_fields(),  # run_id, task_key, source/target_table, collection_instance_id
+            "observation_id": observation_id or str(uuid.uuid4()),
+            "event_type": event_type,
+            "rule_name": rule_name,
+            "message": message,
+            "response_id": response_id,
+            "variable_name": variable_name,
+            "created_timestamp_utc": created_timestamp_utc or datetime.now(timezone.utc),
+        }
