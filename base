@@ -1,0 +1,297 @@
+"""
+BaseLogger — shared buffering / flushing / lifecycle for the logger family.
+
+Subclasses (ExceptionLogger, EventLogger, future LoggerX) each declare their
+own Delta schema and their own public logging API, but delegate everything
+else to this class. See REFACTOR_NOTES.md for the design rationale.
+"""
+
+from __future__ import annotations
+
+import logging
+from abc import ABC, abstractmethod
+from typing import List
+
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType
+
+from utils.logger.context import RunContext
+
+log = logging.getLogger(__name__)
+
+
+class BaseLogger(ABC):
+    """
+    Buffered writer for structured log records into a Delta table.
+
+    This is an abstract class — ``BaseLogger(...)`` directly will raise.
+    Use one of the concrete subclasses (``ExceptionLogger``, ``EventLogger``).
+
+    Subclasses must provide:
+        * ``_schema`` — the Delta table schema for their target table.
+    """
+
+    # ────────────────────────────────────────────────────────
+    # Abstract surface — subclasses MUST implement
+    # ────────────────────────────────────────────────────────
+
+    @property
+    @abstractmethod
+    def _schema(self) -> StructType:
+        """
+        The Delta schema this logger writes. Each subclass provides its own.
+
+        Declared as an abstract property so that Python raises TypeError if
+        a subclass forgets to define it, rather than discovering the gap
+        at flush time.
+        """
+
+    # ────────────────────────────────────────────────────────
+    # Constructor
+    # ────────────────────────────────────────────────────────
+
+    def __init__(
+        self,
+        spark: SparkSession,
+        context: RunContext,
+        table_path: str,
+        batch_size: int,
+    ):
+        """
+        Initialise shared state.
+
+        Subclasses call this via ``super().__init__(...)`` from their own
+        ``__init__``, then add their subclass-specific state (registries,
+        caches, etc.) after the call.
+
+        Args:
+            spark: Active SparkSession. Used only at flush time.
+            context: RunContext — run_id, task_key, source_table, etc.
+                All fields from this context are stamped onto every record.
+            table_path: Fully-qualified Delta table (e.g.
+                ``socpophousdata1_dev.social_census_logs.exceptions``).
+            batch_size: Records to buffer before auto-flush.
+
+        Raises:
+            ValueError: if batch_size is not positive.
+        """
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0, got {batch_size}")
+
+        self._spark = spark
+        self._context = context
+        self._table_path = table_path
+        self._batch_size = batch_size
+        self._buffer: List[dict] = []
+
+        # Validate once at construction — fail fast if the target table
+        # doesn't exist or the schema doesn't match. Catches the problem
+        # before any log records are accepted rather than mid-flush.
+        self._validate_table_contract()
+
+    # ────────────────────────────────────────────────────────
+    # Context manager protocol
+    # ────────────────────────────────────────────────────────
+
+    def __enter__(self) -> "BaseLogger":
+        """
+        Entry point for ``with logger: ...``.
+
+        Returns self so the ``as`` clause binds the logger to a local
+        variable — ``with logger as lg: lg.log(...)``.
+        """
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        """
+        Flush remaining buffered records on block exit.
+
+        The three arguments are Python's context-manager protocol:
+            * exc_type — type of the exception, or None if exiting cleanly
+            * exc_val  — the exception instance, or None
+            * exc_tb   — the traceback, or None
+
+        If the block is exiting cleanly and flush fails, let the flush
+        failure propagate — it's the only error the caller needs to know
+        about.
+
+        If the block is exiting because the caller's code raised AND flush
+        also fails, we prefer to surface the caller's original exception.
+        The flush failure is logged to stdlib but not re-raised, because
+        re-raising would mask the root cause.
+
+        Returning ``False`` tells Python "I did not handle the exception
+        that's propagating out of the block" — so if the block raised,
+        the original exception continues to propagate.
+        """
+        try:
+            self.flush()
+        except Exception as flush_exc:
+            if exc_val is None:
+                # No exception from the block — propagate the flush failure.
+                raise
+            # Exception was already propagating; don't mask it.
+            log.error(
+                "Flush failed while exiting context manager for %s: %s",
+                self._table_path, flush_exc,
+            )
+        return False  # never suppress an exception the block raised
+
+    # ────────────────────────────────────────────────────────
+    # Public API
+    # ────────────────────────────────────────────────────────
+
+    def flush(self) -> None:
+        """
+        Append buffered records to the Delta table and clear the buffer.
+
+        Fail-fast on write error: the buffer is *preserved* (so a retry is
+        possible) and a RuntimeError is raised with the original exception
+        chained. An empty buffer is a no-op — it is safe and expected for
+        callers to flush even when nothing has been logged.
+
+        Why we build the DataFrame before clearing the buffer:
+            If `createDataFrame` or the write raises after the buffer has
+            been cleared, the records are lost forever. By clearing the
+            buffer *only* after a successful write, retries and diagnostics
+            remain possible.
+        """
+        if not self._buffer:
+            return
+
+        try:
+            df = self._spark.createDataFrame(self._buffer, schema=self._schema)
+            df.write.mode("append").format("delta").saveAsTable(self._table_path)
+        except Exception as exc:
+            # Emit a stdlib warning so operators see the failure even if
+            # the caller later catches the RuntimeError upstream. We do
+            # *not* clear the buffer — the caller may want to retry.
+            log.warning(
+                "Log flush failed for %s (%d record(s) retained): %s",
+                self._table_path, len(self._buffer), exc,
+            )
+            raise RuntimeError(
+                f"Failed to write {len(self._buffer)} log record(s) "
+                f"to {self._table_path}"
+            ) from exc
+
+        self._buffer.clear()
+
+    # ────────────────────────────────────────────────────────
+    # Introspection — read-only accessors for tests and debugging
+    # ────────────────────────────────────────────────────────
+
+    @property
+    def buffer_size(self) -> int:
+        """Number of records currently buffered (unflushed)."""
+        return len(self._buffer)
+
+    @property
+    def table_path(self) -> str:
+        """Fully-qualified path of the target Delta table."""
+        return self._table_path
+
+    # ────────────────────────────────────────────────────────
+    # Protected helpers for subclasses
+    # ────────────────────────────────────────────────────────
+
+    def _add_to_buffer(self, record: dict) -> None:
+        """
+        Append a fully-assembled record to the buffer and auto-flush
+        if the batch size has been reached.
+
+        Subclasses call this from their public ``log()`` / ``log_event()``
+        method after they've built the record dict. They should NOT touch
+        ``self._buffer`` directly — if we later add buffer-level logic
+        (deduplication, sampling, etc.), it goes here, and all subclasses
+        benefit.
+        """
+        self._buffer.append(record)
+        if len(self._buffer) >= self._batch_size:
+            self.flush()
+
+    def _context_fields(self) -> dict:
+        """
+        Return the subset of RunContext fields every logger emits.
+
+        Both the exceptions and events tables share six context-derived
+        columns. Collecting them here means:
+            * Subclasses write ``{**self._context_fields(), ...}`` instead
+              of hand-listing six fields per record.
+            * Adding a new context field later (``parent_run_id``, etc.)
+              means updating one method, and every logger picks it up.
+
+        Returns a fresh dict on each call — subclasses can safely mutate
+        the returned dict without affecting the logger's internal state.
+        """
+        return {
+            "run_id": self._context.run_id,
+            "job_id": self._context.job_id,
+            "task_key": self._context.task_key,
+            "source_table": self._context.source_table,
+            "target_table": self._context.target_table,
+            "collection_instance_id": self._context.collection_instance_id,
+        }
+
+    # ────────────────────────────────────────────────────────
+    # Internal — table contract validation
+    # ────────────────────────────────────────────────────────
+
+    def _validate_table_contract(self) -> None:
+        """
+        Verify the target Delta table exists with a compatible schema.
+
+        "Compatible" means every column declared by ``self._schema`` exists
+        in the target table with a matching data type. The target table may
+        have *additional* columns the logger doesn't write — those will be
+        NULL in appended rows, which is valid Delta behaviour.
+
+        Called once from __init__. We do not auto-create missing tables;
+        creation is a migration concern and should be done via DDL with
+        proper comments, tags, and clustering — never by a writer.
+
+        Raises:
+            TableContractError: if the table is missing or its schema is
+                incompatible with ``self._schema``.
+        """
+        if not self._spark.catalog.tableExists(self._table_path):
+            raise TableContractError(
+                f"Log table {self._table_path!r} does not exist. "
+                f"It must be pre-created by a migration — loggers do not "
+                f"auto-create tables."
+            )
+
+        actual_schema = self._spark.table(self._table_path).schema
+        actual_types = {field.name: field.dataType for field in actual_schema}
+
+        mismatches: list[str] = []
+        for expected_field in self._schema.fields:
+            name = expected_field.name
+            expected_type = expected_field.dataType
+
+            if name not in actual_types:
+                mismatches.append(
+                    f"column {name!r} missing from target table"
+                )
+                continue
+
+            if actual_types[name] != expected_type:
+                mismatches.append(
+                    f"column {name!r} type mismatch: "
+                    f"logger expects {expected_type.simpleString()}, "
+                    f"table has {actual_types[name].simpleString()}"
+                )
+
+        if mismatches:
+            raise TableContractError(
+                f"Schema mismatch for {self._table_path!r}:\n  - "
+                + "\n  - ".join(mismatches)
+            )
+
+
+class TableContractError(RuntimeError):
+    """
+    Raised when a logger's expected schema doesn't match the target
+    Delta table. Carries a descriptive message listing every mismatch so
+    operators can fix all problems in one pass rather than iteratively.
+    """
