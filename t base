@@ -1,0 +1,695 @@
+"""
+Unit tests for utils.logger.base_logger.
+
+Test doubles defined at the top of the file:
+    * FakeDataFrame / FakeSpark / FakeCatalog / FakeTable — stand in for
+      the PySpark APIs the logger uses. Never talks to a real cluster.
+    * ConcreteLogger — satisfies BaseLogger's abstract surface so we can
+      instantiate something and exercise the base-class behaviour.
+
+Almost every test uses the ``_make_spark`` helper to get a FakeSpark with
+the test table already registered in the catalog. This is cleaner than a
+pytest fixture for this file because some tests want to vary the failure
+flags (``raise_on_create``, ``raise_on_save``) and helpers take kwargs
+more naturally than fixtures do.
+"""
+
+import pytest
+from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+
+from utils.logger.base_logger import BaseLogger, TableContractError
+from utils.logger.context import RunContext
+
+
+# ─────────────────────────────────────────────
+# Test doubles
+# ─────────────────────────────────────────────
+
+class FakeDataFrame:
+    """
+    Stand-in for a PySpark DataFrame — records the write chain so tests
+    can assert on it without actually writing to Delta.
+    """
+    def __init__(self, rows, schema, raise_on_save: bool = False):
+        self.rows = rows
+        self.schema = schema
+        self.raise_on_save = raise_on_save
+        self._mode = None
+        self._format = None
+        self.saved_to = None
+
+    @property
+    def write(self):
+        # Return self so .mode().format().saveAsTable(...) can chain on
+        # the DataFrame. Simplest fake that mimics the real API shape.
+        return self
+
+    def mode(self, mode: str) -> "FakeDataFrame":
+        self._mode = mode
+        return self
+
+    def format(self, fmt: str) -> "FakeDataFrame":
+        self._format = fmt
+        return self
+
+    def saveAsTable(self, table_path: str) -> None:  # noqa: N802 — mimics Spark API
+        if self.raise_on_save:
+            raise RuntimeError("simulated Spark write failure")
+        self.saved_to = table_path
+
+
+class FakeCatalog:
+    """Stand-in for ``spark.catalog``. Remembers which tables exist."""
+
+    def __init__(self):
+        self._tables: dict[str, StructType] = {}
+
+    def register(self, table_path: str, schema: StructType) -> None:
+        """Simulate a table with this schema existing in the metastore."""
+        self._tables[table_path] = schema
+
+    def tableExists(self, table_path: str) -> bool:  # noqa: N802 — mimics Spark API
+        return table_path in self._tables
+
+    def schema_for(self, table_path: str) -> StructType:
+        return self._tables[table_path]
+
+
+class FakeTable:
+    """Minimal stand-in for DataFrame returned by spark.table()."""
+    def __init__(self, schema: StructType):
+        self.schema = schema
+
+
+class FakeSpark:
+    """
+    Stand-in SparkSession. Carries a FakeCatalog so the logger's
+    table-contract validation can run without Databricks, and records
+    every DataFrame created so tests can inspect writes.
+    """
+    def __init__(self, raise_on_create: bool = False, raise_on_save: bool = False):
+        self.raise_on_create = raise_on_create
+        self.raise_on_save = raise_on_save
+        self.created: list[FakeDataFrame] = []
+        self.catalog = FakeCatalog()
+
+    def createDataFrame(self, rows, schema):  # noqa: N802 — mimics Spark API
+        if self.raise_on_create:
+            raise RuntimeError("simulated createDataFrame failure")
+        df = FakeDataFrame(list(rows), schema, raise_on_save=self.raise_on_save)
+        self.created.append(df)
+        return df
+
+    def table(self, table_path: str) -> FakeTable:
+        return FakeTable(self.catalog.schema_for(table_path))
+
+
+class ConcreteLogger(BaseLogger):
+    """
+    Minimal concrete subclass that satisfies BaseLogger's abstract surface.
+    Only purpose: exercise BaseLogger without pulling in the full
+    ExceptionLogger / EventLogger machinery.
+    """
+
+    _TEST_SCHEMA = StructType([
+        StructField("observation_id", StringType(), False),
+    ])
+
+    @property
+    def _schema(self) -> StructType:
+        return self._TEST_SCHEMA
+
+
+# ─────────────────────────────────────────────
+# Test helpers
+# ─────────────────────────────────────────────
+
+def _make_spark(
+    raise_on_create: bool = False,
+    raise_on_save: bool = False,
+) -> FakeSpark:
+    """
+    Return a FakeSpark with the test table paths pre-registered against
+    ConcreteLogger's schema. This is what most tests want — a "healthy"
+    spark session where the target table exists and has a matching schema.
+
+    Tests that want to simulate a *missing* table should use ``FakeSpark()``
+    directly (no registration).
+    """
+    spark = FakeSpark(raise_on_create=raise_on_create, raise_on_save=raise_on_save)
+    spark.catalog.register("cat.schema.tbl", ConcreteLogger._TEST_SCHEMA)
+    spark.catalog.register("cat.schema.exceptions", ConcreteLogger._TEST_SCHEMA)
+    return spark
+
+
+# ─────────────────────────────────────────────
+# Fixtures
+# ─────────────────────────────────────────────
+
+@pytest.fixture
+def run_context() -> RunContext:
+    """A plain RunContext for tests — no Databricks auto-resolution needed."""
+    return RunContext(
+        run_id="run-123",
+        job_id="job-xyz",
+        task_key="test_task",
+        collection_instance_id="ci-1",
+    )
+
+
+# ─────────────────────────────────────────────
+# Abstract-class enforcement
+# ─────────────────────────────────────────────
+
+def test_cannot_instantiate_base_logger_directly(run_context: RunContext):
+    """
+    Python's ABC machinery must prevent direct instantiation of BaseLogger —
+    the class is a scaffold, not a usable logger on its own.
+    """
+    with pytest.raises(TypeError, match="abstract"):
+        BaseLogger(  # type: ignore[abstract]
+            spark=_make_spark(),
+            context=run_context,
+            table_path="cat.schema.tbl",
+            batch_size=10,
+        )
+
+
+def test_subclass_missing_abstract_schema_cannot_be_instantiated(
+    run_context: RunContext,
+):
+    """
+    A subclass that forgets to define ``_schema`` should also be un-instantiable.
+    Proves the abstract property decorator is actually doing its job.
+    """
+    class BrokenSubclass(BaseLogger):
+        pass  # deliberately omits _schema
+
+    with pytest.raises(TypeError, match="_schema"):
+        BrokenSubclass(  # type: ignore[abstract]
+            spark=_make_spark(),
+            context=run_context,
+            table_path="cat.schema.tbl",
+            batch_size=10,
+        )
+
+
+def test_concrete_subclass_can_be_instantiated(run_context: RunContext):
+    """Happy path — a subclass that satisfies the abstract contract instantiates cleanly."""
+    logger = ConcreteLogger(
+        spark=_make_spark(),
+        context=run_context,
+        table_path="cat.schema.tbl",
+        batch_size=10,
+    )
+    assert logger._schema is ConcreteLogger._TEST_SCHEMA
+
+
+# ─────────────────────────────────────────────
+# Constructor validation
+# ─────────────────────────────────────────────
+
+@pytest.mark.parametrize("bad_size", [0, -1, -100])
+def test_non_positive_batch_size_rejected(run_context: RunContext, bad_size: int):
+    """batch_size <= 0 is a programming error — surface it at construction."""
+    with pytest.raises(ValueError, match="batch_size must be > 0"):
+        ConcreteLogger(
+            spark=_make_spark(),
+            context=run_context,
+            table_path="cat.schema.tbl",
+            batch_size=bad_size,
+        )
+
+
+def test_constructor_stores_all_fields(run_context: RunContext):
+    """Spot-check that every constructor argument lands on a private field."""
+    spark = _make_spark()
+    logger = ConcreteLogger(
+        spark=spark,
+        context=run_context,
+        table_path="cat.schema.tbl",
+        batch_size=42,
+    )
+
+    assert logger._spark is spark
+    assert logger._context is run_context
+    assert logger._table_path == "cat.schema.tbl"
+    assert logger._batch_size == 42
+    assert logger._buffer == []
+
+
+# ─────────────────────────────────────────────
+# Table-contract validation
+# ─────────────────────────────────────────────
+#
+# These tests exercise _validate_table_contract directly — they are the
+# reason the constructor now touches the Spark catalog.
+
+def test_missing_table_rejected(run_context: RunContext):
+    """
+    Construction must fail loudly when the target Delta table doesn't
+    exist. Auto-creation is a migration concern, not a logger concern.
+    """
+    spark = FakeSpark()  # deliberately NOT calling _make_spark — nothing registered
+
+    with pytest.raises(TableContractError, match="does not exist"):
+        ConcreteLogger(
+            spark=spark,
+            context=run_context,
+            table_path="cat.schema.missing_table",
+            batch_size=10,
+        )
+
+
+def test_missing_column_rejected(run_context: RunContext):
+    """
+    If the target table is missing a column the logger writes, surface
+    the specific column name in the error so operators know what to fix.
+    """
+    spark = FakeSpark()
+    # Target table has no columns — the logger needs observation_id.
+    spark.catalog.register("cat.schema.tbl", StructType([]))
+
+    with pytest.raises(TableContractError, match="observation_id.*missing"):
+        ConcreteLogger(
+            spark=spark,
+            context=run_context,
+            table_path="cat.schema.tbl",
+            batch_size=10,
+        )
+
+
+def test_type_mismatch_rejected(run_context: RunContext):
+    """
+    If the target table has the right column name but the wrong type,
+    surface BOTH types in the error so operators can pick which is right.
+    """
+    spark = FakeSpark()
+    # observation_id as an Integer — we expect String.
+    spark.catalog.register(
+        "cat.schema.tbl",
+        StructType([StructField("observation_id", IntegerType(), False)]),
+    )
+
+    with pytest.raises(TableContractError) as exc_info:
+        ConcreteLogger(
+            spark=spark,
+            context=run_context,
+            table_path="cat.schema.tbl",
+            batch_size=10,
+        )
+
+    message = str(exc_info.value)
+    assert "observation_id" in message
+    assert "string" in message  # logger's expected type
+    assert "int" in message     # table's actual type
+
+
+def test_extra_columns_in_target_allowed(run_context: RunContext):
+    """
+    The compatibility model is "logger's columns are a subset of target's
+    columns." Extra columns in the target (e.g. added later by a migration)
+    should NOT cause construction to fail — the appended rows simply leave
+    those columns NULL, which is valid Delta behaviour.
+    """
+    spark = FakeSpark()
+    spark.catalog.register(
+        "cat.schema.tbl",
+        StructType([
+            StructField("observation_id", StringType(), False),
+            StructField("future_column", StringType(), True),  # we don't know this
+        ]),
+    )
+
+    # Should not raise.
+    ConcreteLogger(
+        spark=spark,
+        context=run_context,
+        table_path="cat.schema.tbl",
+        batch_size=10,
+    )
+
+
+def test_contract_error_lists_all_mismatches(run_context: RunContext):
+    """
+    When multiple columns are wrong, report all of them in one error so
+    operators can fix everything in one pass rather than iteratively.
+    This is a kindness test — the feature still works if it only reports
+    the first failure, but the UX is worse.
+    """
+    spark = FakeSpark()
+    spark.catalog.register("cat.schema.tbl", StructType([]))
+
+    # Define a subclass with two columns, both of which will be missing.
+    class MultiColumnLogger(BaseLogger):
+        _MULTI_SCHEMA = StructType([
+            StructField("col_a", StringType(), False),
+            StructField("col_b", StringType(), False),
+        ])
+
+        @property
+        def _schema(self) -> StructType:
+            return self._MULTI_SCHEMA
+
+    with pytest.raises(TableContractError) as exc_info:
+        MultiColumnLogger(
+            spark=spark,
+            context=run_context,
+            table_path="cat.schema.tbl",
+            batch_size=10,
+        )
+
+    message = str(exc_info.value)
+    assert "col_a" in message
+    assert "col_b" in message
+
+
+# ─────────────────────────────────────────────
+# Properties
+# ─────────────────────────────────────────────
+
+def test_buffer_size_reflects_buffer(run_context: RunContext):
+    """buffer_size is a read-only view of len(self._buffer)."""
+    logger = ConcreteLogger(
+        spark=_make_spark(),
+        context=run_context,
+        table_path="cat.schema.tbl",
+        batch_size=10,
+    )
+
+    assert logger.buffer_size == 0
+
+    logger._buffer.append({"observation_id": "a"})
+    logger._buffer.append({"observation_id": "b"})
+
+    assert logger.buffer_size == 2
+
+
+def test_table_path_exposes_the_target(run_context: RunContext):
+    """Public accessor for the private _table_path."""
+    logger = ConcreteLogger(
+        spark=_make_spark(),
+        context=run_context,
+        table_path="cat.schema.exceptions",
+        batch_size=10,
+    )
+
+    assert logger.table_path == "cat.schema.exceptions"
+
+
+# ─────────────────────────────────────────────
+# flush()
+# ─────────────────────────────────────────────
+
+def test_flush_empty_buffer_is_noop(run_context: RunContext):
+    """Flushing nothing must not raise and must not write — valid graceful shutdown."""
+    spark = _make_spark()
+    logger = ConcreteLogger(
+        spark=spark, context=run_context, table_path="cat.schema.tbl", batch_size=10,
+    )
+
+    logger.flush()
+
+    assert spark.created == []
+
+
+def test_flush_writes_buffered_records(run_context: RunContext):
+    """Happy path — records accumulate, flush writes them, buffer clears."""
+    spark = _make_spark()
+    logger = ConcreteLogger(
+        spark=spark, context=run_context, table_path="cat.schema.tbl", batch_size=100,
+    )
+
+    logger._buffer.append({"observation_id": "a"})
+    logger._buffer.append({"observation_id": "b"})
+
+    logger.flush()
+
+    assert len(spark.created) == 1
+    df = spark.created[0]
+    assert df.rows == [{"observation_id": "a"}, {"observation_id": "b"}]
+    assert df._mode == "append"
+    assert df._format == "delta"
+    assert df.saved_to == "cat.schema.tbl"
+    assert logger.buffer_size == 0
+
+
+def test_flush_preserves_buffer_on_createDataFrame_failure(run_context: RunContext):
+    """
+    If the write fails, the buffer must stay populated so the caller
+    can retry or at least see what wasn't written. Opposite of the bug
+    in the original EventLogger, which cleared the buffer before the write.
+    """
+    spark = _make_spark(raise_on_create=True)
+    logger = ConcreteLogger(
+        spark=spark, context=run_context, table_path="cat.schema.tbl", batch_size=10,
+    )
+
+    logger._buffer.append({"observation_id": "a"})
+
+    with pytest.raises(RuntimeError, match="Failed to write 1 log record"):
+        logger.flush()
+
+    assert logger.buffer_size == 1
+
+
+def test_flush_preserves_buffer_on_save_failure(run_context: RunContext):
+    """Same property as above, but for failures during the .saveAsTable call."""
+    spark = _make_spark(raise_on_save=True)
+    logger = ConcreteLogger(
+        spark=spark, context=run_context, table_path="cat.schema.tbl", batch_size=10,
+    )
+
+    logger._buffer.append({"observation_id": "a"})
+
+    with pytest.raises(RuntimeError, match="Failed to write"):
+        logger.flush()
+
+    assert logger.buffer_size == 1
+
+
+def test_flush_chains_original_exception(run_context: RunContext):
+    """
+    The RuntimeError must carry the original exception as __cause__.
+    Without chaining, operators lose the underlying reason the write failed.
+    """
+    spark = _make_spark(raise_on_create=True)
+    logger = ConcreteLogger(
+        spark=spark, context=run_context, table_path="cat.schema.tbl", batch_size=10,
+    )
+    logger._buffer.append({"observation_id": "a"})
+
+    with pytest.raises(RuntimeError) as exc_info:
+        logger.flush()
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert "simulated createDataFrame failure" in str(exc_info.value.__cause__)
+
+
+# ─────────────────────────────────────────────
+# Context manager protocol
+# ─────────────────────────────────────────────
+
+def test_context_manager_returns_self(run_context: RunContext):
+    """``with logger as lg`` must bind lg to the same object the caller passed in."""
+    logger = ConcreteLogger(
+        spark=_make_spark(), context=run_context,
+        table_path="cat.schema.tbl", batch_size=10,
+    )
+
+    with logger as lg:
+        assert lg is logger
+
+
+def test_context_manager_flushes_on_clean_exit(run_context: RunContext):
+    """The main reason context managers exist — auto-flush on normal exit."""
+    spark = _make_spark()
+    logger = ConcreteLogger(
+        spark=spark, context=run_context,
+        table_path="cat.schema.tbl", batch_size=100,
+    )
+
+    with logger as lg:
+        lg._buffer.append({"observation_id": "a"})
+        assert lg.buffer_size == 1
+
+    assert logger.buffer_size == 0
+    assert len(spark.created) == 1
+
+
+def test_context_manager_flushes_on_exception_exit(run_context: RunContext):
+    """
+    Records buffered before an exception must still be written. This is
+    the guarantee that makes ``with`` blocks safe — pipeline failure
+    doesn't eat the diagnostic records explaining WHY it failed.
+    """
+    spark = _make_spark()
+    logger = ConcreteLogger(
+        spark=spark, context=run_context,
+        table_path="cat.schema.tbl", batch_size=100,
+    )
+
+    with pytest.raises(RuntimeError, match="pipeline failure"):
+        with logger as lg:
+            lg._buffer.append({"observation_id": "a"})
+            raise RuntimeError("pipeline failure")
+
+    assert len(spark.created) == 1
+    assert spark.created[0].rows == [{"observation_id": "a"}]
+
+
+def test_context_manager_does_not_suppress_caller_exception(
+    run_context: RunContext,
+):
+    """Any exception from the ``with`` block must propagate unchanged."""
+    logger = ConcreteLogger(
+        spark=_make_spark(), context=run_context,
+        table_path="cat.schema.tbl", batch_size=10,
+    )
+
+    class BusinessLogicError(Exception):
+        pass
+
+    with pytest.raises(BusinessLogicError, match="specific message"):
+        with logger:
+            raise BusinessLogicError("specific message")
+
+
+def test_context_manager_propagates_flush_failure_on_clean_exit(
+    run_context: RunContext,
+):
+    """If the block exits cleanly but flush fails, the flush exception propagates."""
+    spark = _make_spark(raise_on_create=True)
+    logger = ConcreteLogger(
+        spark=spark, context=run_context,
+        table_path="cat.schema.tbl", batch_size=10,
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to write"):
+        with logger as lg:
+            lg._buffer.append({"observation_id": "a"})
+
+
+def test_context_manager_prefers_caller_exception_over_flush_failure(
+    run_context: RunContext, caplog
+):
+    """
+    If both the block raises AND flush fails, the block's exception wins
+    (it's the root cause). The flush failure is still logged to stdlib.
+
+    ``caplog`` is a pytest built-in fixture that captures stdlib log
+    messages so tests can assert on them.
+    """
+    spark = _make_spark(raise_on_create=True)
+    logger = ConcreteLogger(
+        spark=spark, context=run_context,
+        table_path="cat.schema.tbl", batch_size=10,
+    )
+
+    class RootCauseError(Exception):
+        pass
+
+    with pytest.raises(RootCauseError):
+        with logger as lg:
+            lg._buffer.append({"observation_id": "a"})
+            raise RootCauseError("this is the real problem")
+
+    assert any(
+        "Flush failed" in record.message for record in caplog.records
+    )
+
+
+# ─────────────────────────────────────────────
+# Protected helpers for subclasses
+# ─────────────────────────────────────────────
+
+def test_add_to_buffer_appends_record(run_context: RunContext):
+    """Basic append — no auto-flush because we're under batch_size."""
+    spark = _make_spark()
+    logger = ConcreteLogger(
+        spark=spark, context=run_context,
+        table_path="cat.schema.tbl", batch_size=10,
+    )
+
+    logger._add_to_buffer({"observation_id": "a"})
+    logger._add_to_buffer({"observation_id": "b"})
+
+    assert logger.buffer_size == 2
+    assert spark.created == []
+
+
+def test_add_to_buffer_auto_flushes_at_batch_size(run_context: RunContext):
+    """When the buffer reaches batch_size, the helper triggers an automatic flush."""
+    spark = _make_spark()
+    logger = ConcreteLogger(
+        spark=spark, context=run_context,
+        table_path="cat.schema.tbl", batch_size=3,
+    )
+
+    logger._add_to_buffer({"observation_id": "a"})
+    logger._add_to_buffer({"observation_id": "b"})
+    assert logger.buffer_size == 2
+    assert spark.created == []
+
+    logger._add_to_buffer({"observation_id": "c"})
+
+    assert logger.buffer_size == 0
+    assert len(spark.created) == 1
+    assert len(spark.created[0].rows) == 3
+
+
+def test_context_fields_returns_all_six_context_columns(run_context: RunContext):
+    """The method must return every context-derived field — and nothing else."""
+    logger = ConcreteLogger(
+        spark=_make_spark(), context=run_context,
+        table_path="cat.schema.tbl", batch_size=10,
+    )
+
+    fields = logger._context_fields()
+
+    assert fields == {
+        "run_id": "run-123",
+        "job_id": "job-xyz",
+        "task_key": "test_task",
+        "source_table": None,
+        "target_table": None,
+        "collection_instance_id": "ci-1",
+    }
+
+
+def test_context_fields_returns_fresh_dict_each_call(run_context: RunContext):
+    """
+    Callers may mutate the returned dict. We must return a new dict every
+    call so mutations don't leak into future log records.
+    """
+    logger = ConcreteLogger(
+        spark=_make_spark(), context=run_context,
+        table_path="cat.schema.tbl", batch_size=10,
+    )
+
+    first = logger._context_fields()
+    first["run_id"] = "mutated"
+
+    second = logger._context_fields()
+    assert second["run_id"] == "run-123"
+    assert first is not second
+
+
+def test_context_fields_includes_populated_source_and_target(run_context: RunContext):
+    """When RunContext has source/target tables, those fields flow through."""
+    populated_context = RunContext(
+        run_id="run-123",
+        job_id="job-xyz",
+        task_key="test_task",
+        collection_instance_id="ci-1",
+        source_table="cat.schema.src",
+        target_table="cat.schema.tgt",
+    )
+    logger = ConcreteLogger(
+        spark=_make_spark(), context=populated_context,
+        table_path="cat.schema.tbl", batch_size=10,
+    )
+
+    fields = logger._context_fields()
+    assert fields["source_table"] == "cat.schema.src"
+    assert fields["target_table"] == "cat.schema.tgt"
