@@ -1,0 +1,330 @@
+"""
+Unit tests for utils.logger.exception_logger.
+
+Uses shared test doubles from tests.unit._fakes so the fake Spark surface
+stays in one place across all logger test files.
+"""
+
+from pathlib import Path
+
+import pytest
+import yaml
+
+from tests.unit._fakes import FakeSpark
+from utils.logger.context import RunContext
+from utils.logger.exception_logger import ExceptionLogger
+from utils.logger.registry import load_registry
+from utils.logger.violation import Violation
+
+
+# ─────────────────────────────────────────────
+# Fixtures
+# ─────────────────────────────────────────────
+
+_REGISTRY_YAML = {
+    "metadata": {"version": "1.0"},
+    "validation_rules": {
+        "null_not_allowed": {"error_code": "NULL_NOT_ALLOWED"},
+        "invalid_date_format": {"error_code": "INVALID_DATE_FORMAT"},
+    },
+    "error_codes": {
+        "NULL_NOT_ALLOWED": {
+            "validation_level": "FIELD",
+            "blocking": True,
+            "severity": "ERROR",
+        },
+        "INVALID_DATE_FORMAT": {
+            "validation_level": "FIELD",
+            "blocking": True,
+            "severity": "ERROR",
+        },
+    },
+}
+
+
+@pytest.fixture(autouse=True)
+def _clear_registry_cache():
+    load_registry.cache_clear()
+    yield
+    load_registry.cache_clear()
+
+
+@pytest.fixture
+def registry_file(tmp_path: Path) -> Path:
+    p = tmp_path / "error_codes.yml"
+    p.write_text(yaml.safe_dump(_REGISTRY_YAML))
+    return p
+
+
+@pytest.fixture
+def run_context() -> RunContext:
+    return RunContext(
+        run_id="run-xyz",
+        job_id="job-abc",
+        task_key="test_task",
+        collection_instance_id="2027-TEST-001",
+        source_table="cat.schema.src",
+        target_table="cat.schema.tgt",
+    )
+
+
+def _make_spark(
+    raise_on_create: bool = False, raise_on_save: bool = False,
+) -> FakeSpark:
+    """
+    A FakeSpark pre-registered with the exceptions table against
+    ExceptionLogger's schema. Every logger-construction test needs this,
+    because BaseLogger.__init__ now validates the table contract.
+    """
+    spark = FakeSpark(raise_on_create=raise_on_create, raise_on_save=raise_on_save)
+    spark.catalog.register("cat.logs.exceptions", ExceptionLogger._SCHEMA)
+    return spark
+
+
+@pytest.fixture
+def logger(registry_file: Path, run_context: RunContext) -> ExceptionLogger:
+    return ExceptionLogger(
+        spark=_make_spark(),  # type: ignore[arg-type]
+        registry=load_registry(registry_file),
+        context=run_context,
+        table_path="cat.logs.exceptions",
+        batch_size=100,
+    )
+
+
+# ─────────────────────────────────────────────
+# Construction
+# ─────────────────────────────────────────────
+
+def test_batch_size_zero_rejected(registry_file: Path, run_context: RunContext):
+    with pytest.raises(ValueError, match="batch_size must be > 0"):
+        ExceptionLogger(
+            spark=_make_spark(),  # type: ignore[arg-type]
+            registry=load_registry(registry_file),
+            context=run_context,
+            table_path="cat.logs.exceptions",
+            batch_size=0,
+        )
+
+
+def test_batch_size_negative_rejected(registry_file: Path, run_context: RunContext):
+    with pytest.raises(ValueError, match="batch_size must be > 0"):
+        ExceptionLogger(
+            spark=_make_spark(),  # type: ignore[arg-type]
+            registry=load_registry(registry_file),
+            context=run_context,
+            table_path="cat.logs.exceptions",
+            batch_size=-1,
+        )
+
+
+# ─────────────────────────────────────────────
+# Record assembly
+# ─────────────────────────────────────────────
+
+def test_log_assembles_expected_fields(logger: ExceptionLogger):
+    logger.log(
+        rule="invalid_date_format",
+        event_type="DATACONTRACTVALIDATION",
+        field="date_of_birth",
+        expected="yyyy-mm-dd",
+        observed="32/13/2023",
+        response_id="P123",
+    )
+
+    assert logger.buffer_size == 1
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    [record] = spark.created[0].rows
+
+    # Governance fields come from the registry, not the caller.
+    assert record["error_code"] == "INVALID_DATE_FORMAT"
+    assert record["validation_level"] == "FIELD"
+    assert record["severity"] == "ERROR"
+    assert record["is_blocking"] is True
+
+    # Caller fields are passed through untouched.
+    assert record["event_type"] == "DATACONTRACTVALIDATION"
+    assert record["variable_name"] == "date_of_birth"
+    assert record["response_id"] == "P123"
+    assert record["stack_trace"] is None
+
+    # Context fields come from RunContext.
+    assert record["run_id"] == "run-xyz"
+    assert record["job_id"] == "job-abc"
+    assert record["task_key"] == "test_task"
+    assert record["collection_instance_id"] == "2027-TEST-001"
+
+    # Auto-generated message quotes values for readability.
+    assert "Rule 'invalid_date_format'" in record["message"]
+    assert "'32/13/2023'" in record["message"]
+
+
+def test_log_accepts_custom_message_and_stack_trace(logger: ExceptionLogger):
+    logger.log(
+        rule="null_not_allowed",
+        event_type="DATACONTRACTVALIDATION",
+        field="person_nbr",
+        message="custom message",
+        stack_trace="Traceback (most recent call last):\n  ...",
+    )
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    [record] = spark.created[0].rows
+
+    assert record["message"] == "custom message"
+    assert record["stack_trace"].startswith("Traceback")
+
+
+def test_log_unknown_rule_raises(logger: ExceptionLogger):
+    with pytest.raises(KeyError, match="Unknown validation rule"):
+        logger.log(rule="not_a_real_rule", event_type="TEST")
+
+
+# ─────────────────────────────────────────────
+# Batch semantics
+# ─────────────────────────────────────────────
+
+def test_log_many_with_scalar_response_id(logger: ExceptionLogger):
+    """Common path — all violations share the same response_id."""
+    violations = [
+        Violation(rule="invalid_date_format", field="dob", expected="d", observed="x"),
+        Violation(rule="null_not_allowed", field="name"),
+    ]
+    logger.log_many(
+        violations, event_type="DATACONTRACTVALIDATION", response_id="P999"
+    )
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    records = spark.created[0].rows
+
+    assert [r["response_id"] for r in records] == ["P999", "P999"]
+
+
+def test_log_many_with_aligned_response_id_list(logger: ExceptionLogger):
+    violations = [
+        Violation(rule="invalid_date_format"),
+        Violation(rule="null_not_allowed"),
+    ]
+    logger.log_many(
+        violations,
+        event_type="DATACONTRACTVALIDATION",
+        response_id=["A", "B"],
+    )
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    records = spark.created[0].rows
+    assert [r["response_id"] for r in records] == ["A", "B"]
+
+
+def test_log_many_mismatched_response_id_list_rejected(logger: ExceptionLogger):
+    violations = [Violation(rule="null_not_allowed"), Violation(rule="null_not_allowed")]
+    with pytest.raises(ValueError, match="does not match violation count"):
+        logger.log_many(
+            violations, event_type="DC", response_id=["only_one"]
+        )
+
+
+def test_log_many_shares_single_timestamp(logger: ExceptionLogger):
+    """All records from one log_many call must have identical timestamps."""
+    violations = [Violation(rule="null_not_allowed") for _ in range(5)]
+    logger.log_many(violations, event_type="DC")
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    records = spark.created[0].rows
+    timestamps = {r["created_timestamp_utc"] for r in records}
+    assert len(timestamps) == 1, "all records in one batch should share a timestamp"
+
+
+def test_auto_flush_on_batch_size(registry_file: Path, run_context: RunContext):
+    spark = _make_spark()
+    logger = ExceptionLogger(
+        spark=spark,  # type: ignore[arg-type]
+        registry=load_registry(registry_file),
+        context=run_context,
+        table_path="cat.logs.exceptions",
+        batch_size=2,
+    )
+
+    logger.log(rule="null_not_allowed", event_type="DC")
+    assert logger.buffer_size == 1
+    assert spark.created == []
+
+    logger.log(rule="null_not_allowed", event_type="DC")
+    # Hit batch_size — should have auto-flushed. spark.created is now a
+    # list of FakeDataFrame objects (shared helper format), and each df
+    # carries its rows in .rows.
+    assert logger.buffer_size == 0
+    assert len(spark.created) == 1
+    assert len(spark.created[0].rows) == 2
+
+
+# ─────────────────────────────────────────────
+# Flush semantics
+# ─────────────────────────────────────────────
+
+def test_flush_empty_buffer_is_noop(logger: ExceptionLogger):
+    logger.flush()  # must not raise, must not write
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    assert spark.created == []
+
+
+def test_flush_failure_preserves_buffer(registry_file: Path, run_context: RunContext):
+    spark = _make_spark(raise_on_create=True)
+    logger = ExceptionLogger(
+        spark=spark,  # type: ignore[arg-type]
+        registry=load_registry(registry_file),
+        context=run_context,
+        table_path="cat.logs.exceptions",
+        batch_size=100,
+    )
+
+    logger.log(rule="null_not_allowed", event_type="DC")
+
+    with pytest.raises(RuntimeError, match="Failed to write"):
+        logger.flush()
+
+    # Buffer must still contain the record — operator needs to see what failed.
+    assert logger.buffer_size == 1
+
+
+# ─────────────────────────────────────────────
+# Context manager
+# ─────────────────────────────────────────────
+
+def test_context_manager_flushes_on_normal_exit(logger: ExceptionLogger):
+    with logger as lg:
+        lg.log(rule="null_not_allowed", event_type="DC")
+        assert lg.buffer_size == 1
+
+    assert logger.buffer_size == 0
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    assert len(spark.created) == 1
+
+
+def test_context_manager_flushes_on_exception_exit(logger: ExceptionLogger):
+    """Pipeline raising shouldn't cause log loss."""
+    with pytest.raises(RuntimeError, match="pipeline failure"):
+        with logger as lg:
+            lg.log(rule="null_not_allowed", event_type="DC")
+            raise RuntimeError("pipeline failure")
+
+    # Records buffered before the exception must still have been flushed.
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    assert len(spark.created) == 1
+    assert len(spark.created[0].rows) == 1
+
+
+def test_context_manager_does_not_suppress_exception(logger: ExceptionLogger):
+    """__exit__ returns False — original exception must propagate."""
+    class MyErr(Exception):
+        pass
+
+    with pytest.raises(MyErr):
+        with logger:
+            raise MyErr("test")
