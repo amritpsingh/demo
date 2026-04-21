@@ -1,0 +1,302 @@
+"""
+Unit tests for utils.logger.event_logger.
+
+Uses shared test doubles from tests.unit._fakes so the fake Spark surface
+stays in one place across all logger test files.
+
+Focuses on EventLogger-specific behaviour — record assembly, optional
+fields, auto-generated IDs and timestamps. Buffer, flush, and context-
+manager semantics are inherited from BaseLogger and covered exhaustively
+in tests/unit/test_base_logger.py, so we don't duplicate those here.
+"""
+
+from datetime import datetime, timezone
+
+import pytest
+
+from tests.unit._fakes import FakeSpark
+from utils.logger.context import RunContext
+from utils.logger.event_logger import EventLogger
+
+
+# ─────────────────────────────────────────────
+# Fixtures
+# ─────────────────────────────────────────────
+
+@pytest.fixture
+def run_context() -> RunContext:
+    return RunContext(
+        run_id="run-xyz",
+        job_id="job-abc",
+        task_key="test_task",
+        collection_instance_id="2027-TEST-001",
+        source_table="cat.schema.src",
+        target_table="cat.schema.tgt",
+    )
+
+
+def _make_spark(
+    raise_on_create: bool = False, raise_on_save: bool = False,
+) -> FakeSpark:
+    """
+    A FakeSpark pre-registered with the events table against EventLogger's
+    schema. Every logger-construction test needs this because BaseLogger
+    validates the table contract at __init__.
+    """
+    spark = FakeSpark(raise_on_create=raise_on_create, raise_on_save=raise_on_save)
+    spark.catalog.register("cat.logs.events", EventLogger._SCHEMA)
+    return spark
+
+
+@pytest.fixture
+def logger(run_context: RunContext) -> EventLogger:
+    return EventLogger(
+        spark=_make_spark(),  # type: ignore[arg-type]
+        context=run_context,
+        table_path="cat.logs.events",
+        batch_size=100,
+    )
+
+
+# ─────────────────────────────────────────────
+# Construction
+# ─────────────────────────────────────────────
+
+def test_batch_size_zero_rejected(run_context: RunContext):
+    """Inherited from BaseLogger, but worth a smoke test at the subclass level."""
+    with pytest.raises(ValueError, match="batch_size must be > 0"):
+        EventLogger(
+            spark=_make_spark(),  # type: ignore[arg-type]
+            context=run_context,
+            table_path="cat.logs.events",
+            batch_size=0,
+        )
+
+
+def test_missing_table_rejected(run_context: RunContext):
+    """
+    Construction fails if the target events table doesn't exist.
+    The table must be pre-created by a migration.
+    """
+    spark = FakeSpark()  # no catalog registration — table appears missing
+    from utils.logger import TableContractError
+
+    with pytest.raises(TableContractError, match="does not exist"):
+        EventLogger(
+            spark=spark,  # type: ignore[arg-type]
+            context=run_context,
+            table_path="cat.logs.events",
+            batch_size=100,
+        )
+
+
+# ─────────────────────────────────────────────
+# Record assembly
+# ─────────────────────────────────────────────
+
+def test_log_event_assembles_expected_fields(logger: EventLogger):
+    """
+    A fully-specified log_event call should produce a record with every
+    caller-supplied field passed through, context fields stamped in, and
+    auto-generated fields (observation_id, timestamp) populated.
+    """
+    logger.log_event(
+        event_type="coding",
+        message="Applied ethnic group coding rules successfully",
+        rule_name="ethnic_group_coding_v1",
+        response_id="P12345",
+        variable_name="ethnic_group",
+    )
+
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    [record] = spark.created[0].rows
+
+    # Caller-supplied fields pass through.
+    assert record["event_type"] == "coding"
+    assert record["message"] == "Applied ethnic group coding rules successfully"
+    assert record["rule_name"] == "ethnic_group_coding_v1"
+    assert record["response_id"] == "P12345"
+    assert record["variable_name"] == "ethnic_group"
+
+    # Context fields stamped in from the RunContext.
+    assert record["run_id"] == "run-xyz"
+    assert record["job_id"] == "job-abc"
+    assert record["task_key"] == "test_task"
+    assert record["source_table"] == "cat.schema.src"
+    assert record["target_table"] == "cat.schema.tgt"
+    assert record["collection_instance_id"] == "2027-TEST-001"
+
+    # Auto-generated fields are present and the right shape.
+    assert record["observation_id"] is not None
+    assert isinstance(record["created_timestamp_utc"], datetime)
+
+
+def test_log_event_optional_fields_default_to_none(logger: EventLogger):
+    """
+    rule_name / response_id / variable_name are all optional. When the
+    caller omits them, they should land in the record as None (not missing
+    keys — the schema requires the column to exist, just not non-null).
+    """
+    logger.log_event(event_type="validation", message="passed")
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    [record] = spark.created[0].rows
+
+    assert record["rule_name"] is None
+    assert record["response_id"] is None
+    assert record["variable_name"] is None
+
+
+def test_log_event_auto_generates_observation_id(logger: EventLogger):
+    """observation_id should be generated when the caller doesn't supply one."""
+    logger.log_event(event_type="coding", message="test")
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    [record] = spark.created[0].rows
+
+    # Sanity-check — observation_id is present, is a string, and looks UUID-ish.
+    import uuid as uuid_mod
+    uuid_mod.UUID(record["observation_id"])  # raises if not a valid UUID
+
+
+def test_log_event_caller_can_override_observation_id(logger: EventLogger):
+    """
+    Sometimes the caller wants to correlate the event record with an
+    external ID. When they pass observation_id explicitly, it must be used.
+    """
+    logger.log_event(
+        event_type="coding",
+        message="test",
+        observation_id="external-id-xyz",
+    )
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    [record] = spark.created[0].rows
+
+    assert record["observation_id"] == "external-id-xyz"
+
+
+def test_log_event_auto_generates_timestamp(logger: EventLogger):
+    """Timestamp defaults to datetime.now(timezone.utc) when not supplied."""
+    before = datetime.now(timezone.utc)
+    logger.log_event(event_type="coding", message="test")
+    after = datetime.now(timezone.utc)
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    [record] = spark.created[0].rows
+
+    # The generated timestamp should sit between the two clock reads.
+    assert before <= record["created_timestamp_utc"] <= after
+    assert record["created_timestamp_utc"].tzinfo == timezone.utc
+
+
+def test_log_event_caller_can_override_timestamp(logger: EventLogger):
+    """
+    Useful when backfilling historical events — the event happened at a
+    specific time in the past, and we want that recorded rather than "now".
+    """
+    past_time = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    logger.log_event(
+        event_type="coding",
+        message="backfill",
+        created_timestamp_utc=past_time,
+    )
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    [record] = spark.created[0].rows
+
+    assert record["created_timestamp_utc"] == past_time
+
+
+# ─────────────────────────────────────────────
+# Batch semantics
+# ─────────────────────────────────────────────
+
+def test_auto_flush_on_batch_size(run_context: RunContext):
+    """
+    When the buffer reaches batch_size, the logger auto-flushes. This is
+    inherited from BaseLogger, but worth confirming the hook is wired up
+    correctly for EventLogger too.
+    """
+    spark = _make_spark()
+    logger = EventLogger(
+        spark=spark,  # type: ignore[arg-type]
+        context=run_context,
+        table_path="cat.logs.events",
+        batch_size=2,
+    )
+
+    logger.log_event(event_type="coding", message="event 1")
+    assert logger.buffer_size == 1
+    assert spark.created == []
+
+    logger.log_event(event_type="coding", message="event 2")
+
+    # Hit batch_size — auto-flushed.
+    assert logger.buffer_size == 0
+    assert len(spark.created) == 1
+    assert len(spark.created[0].rows) == 2
+
+
+# ─────────────────────────────────────────────
+# Context manager
+# ─────────────────────────────────────────────
+
+def test_context_manager_flushes_on_clean_exit(run_context: RunContext):
+    """
+    End-to-end smoke test: using EventLogger as a context manager should
+    auto-flush on exit. Full context-manager semantics (exceptions, flush
+    failures, caller-exception priority) are covered in test_base_logger.py.
+    """
+    spark = _make_spark()
+
+    with EventLogger(
+        spark=spark,  # type: ignore[arg-type]
+        context=run_context,
+        table_path="cat.logs.events",
+        batch_size=100,
+    ) as logger:
+        logger.log_event(event_type="coding", message="test")
+        assert logger.buffer_size == 1
+
+    # Exiting the with block triggered flush.
+    assert len(spark.created) == 1
+    assert len(spark.created[0].rows) == 1
+
+
+# ─────────────────────────────────────────────
+# for_task factory
+# ─────────────────────────────────────────────
+
+def test_for_task_builds_logger_with_resolved_defaults(run_context: RunContext):
+    """
+    for_task should collapse the multi-step setup into one call. We need
+    to patch build_run_context so it returns our test RunContext (the
+    real one tries to read Databricks state).
+    """
+    from unittest.mock import patch
+
+    spark = _make_spark()
+
+    with patch(
+        "utils.logger.event_logger.build_run_context",
+        return_value=run_context,
+    ):
+        logger = EventLogger.for_task(
+            spark=spark,  # type: ignore[arg-type]
+            collection_instance_id="2027-TEST-001",
+            log_table_path="cat.logs.events",  # override the default table path
+        )
+
+    # The logger is fully functional — it can accept and flush events.
+    logger.log_event(event_type="coding", message="test")
+    logger.flush()
+
+    assert len(spark.created) == 1
