@@ -1,0 +1,368 @@
+"""
+ExceptionLogger — structured writer for Data Contract Technical Validation
+failures into the exceptions Delta table.
+
+Inherits from BaseLogger for buffering, flushing, context-manager lifecycle,
+and table-contract validation. Adds the exception-specific surface:
+    * The exceptions Delta schema.
+    * Registry lookup to resolve rule names → governance metadata.
+    * ``log()`` and ``log_many()`` public APIs.
+    * The ``for_task()`` factory that wires everything together in one call.
+
+Caller-facing surface (intentionally tiny):
+
+    from utils.logger import ExceptionLogger
+
+    with ExceptionLogger.for_task(
+        spark=spark,
+        collection_instance_id="2027-CAS-001",
+        source_table="socpophousdata1_dev.social_census_parsed.individual",
+        target_table="socpophousdata1_dev.social_census_validated.individual",
+    ) as logger:
+        logger.log(
+            rule="invalid_date_format",
+            event_type="DATACONTRACTVALIDATION",
+            field="date_of_birth",
+            expected="yyyy-mm-dd",
+            observed="32/13/2023",
+            response_id="P123456789",
+        )
+
+The context manager flushes on exit (including when the block exits via
+an exception), so buffered records are never lost silently.
+"""
+
+from __future__ import annotations
+
+import os
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, List, Optional, Union
+
+from pyspark.sql import SparkSession
+from pyspark.sql.types import (
+    BooleanType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
+
+from utils.logger.base_logger import BaseLogger
+from utils.logger.context import build_run_context
+from utils.logger.registry import (
+    ErrorCodeRegistry,
+    ResolvedCode,
+    load_registry,
+)
+from utils.logger.violation import Violation
+
+
+# Default exceptions Delta table. Override per-task via the ``log_table_path``
+# argument to for_task(), or globally via the environment variable below.
+# TODO: resolve through CollectionConfig.get_table_path() once the logs
+# steady_state is registered there.
+_LOG_TABLE_ENV_VAR = "CENSUS_EXCEPTION_LOG_TABLE"
+_DEFAULT_LOG_TABLE = "socpophousdata1_dev.social_census_logs.exceptions"
+
+_DEFAULT_BATCH_SIZE = 100
+
+
+class ExceptionLogger(BaseLogger):
+    """
+    Buffered writer for the ``social_census_logs.exceptions`` Delta table.
+
+    Not thread-safe. One instance per task — construct via
+    :meth:`ExceptionLogger.for_task`.
+    """
+
+    # The schema this logger writes. Exposed via the ``_schema`` property
+    # below (required by BaseLogger). Stored as a class attribute so every
+    # instance shares the same StructType object — it never varies per run.
+    _SCHEMA: StructType = StructType([
+        StructField("observation_id", StringType(), False),
+        StructField("run_id", StringType(), False),
+        StructField("job_id", StringType(), True),
+        StructField("task_key", StringType(), False),
+        StructField("source_table", StringType(), True),
+        StructField("target_table", StringType(), True),
+        StructField("validation_level", StringType(), False),
+        StructField("event_type", StringType(), False),
+        StructField("error_code", StringType(), False),
+        StructField("severity", StringType(), False),
+        StructField("message", StringType(), True),
+        StructField("response_id", StringType(), True),
+        StructField("collection_instance_id", StringType(), True),
+        StructField("variable_name", StringType(), True),
+        StructField("is_blocking", BooleanType(), False),
+        StructField("stack_trace", StringType(), True),
+        StructField("created_timestamp_utc", TimestampType(), False),
+    ])
+
+    @property
+    def _schema(self) -> StructType:
+        return self._SCHEMA
+
+    # ────────────────────────────────────────────────────────
+    # Constructor
+    # ────────────────────────────────────────────────────────
+
+    def __init__(
+        self,
+        spark: SparkSession,
+        registry: ErrorCodeRegistry,
+        context,
+        table_path: str,
+        batch_size: int = _DEFAULT_BATCH_SIZE,
+    ):
+        """
+        Construct an ExceptionLogger.
+
+        Most callers should use :meth:`for_task` instead — it wires up the
+        registry, context, and default table path automatically.
+
+        Args:
+            spark: Active SparkSession.
+            registry: The error code registry — used to resolve validation
+                rule names into error_code / validation_level / severity /
+                is_blocking.
+            context: RunContext — run_id, task_key, source_table, etc.
+            table_path: Fully-qualified exceptions Delta table.
+            batch_size: Records to buffer before auto-flush.
+        """
+        # Delegate buffering, flushing, context-manager, and table-contract
+        # validation to the base. Schema validation happens here as part of
+        # super().__init__, because BaseLogger reads self._schema during
+        # validation and the subclass's _schema property is already bound.
+        super().__init__(
+            spark=spark,
+            context=context,
+            table_path=table_path,
+            batch_size=batch_size,
+        )
+
+        # Exception-specific state goes after the super() call.
+        self._registry = registry
+
+    # ────────────────────────────────────────────────────────
+    # Factory
+    # ────────────────────────────────────────────────────────
+
+    @classmethod
+    def for_task(
+        cls,
+        spark: SparkSession,
+        *,
+        collection_instance_id: str,
+        task_key: Optional[str] = None,
+        source_table: Optional[str] = None,
+        target_table: Optional[str] = None,
+        log_table_path: Optional[str] = None,
+        registry_path: Optional[Union[str, Path]] = None,
+        batch_size: int = _DEFAULT_BATCH_SIZE,
+    ) -> "ExceptionLogger":
+        """
+        Build a fully-configured ExceptionLogger for a single task.
+
+        Collapses the old four-step setup (load registry → build context →
+        init logger → remember to flush) into one call. The resulting logger
+        is a context manager — use it inside a ``with`` block.
+
+        Args:
+            spark: Active SparkSession.
+            collection_instance_id: Sub-operation the data relates to
+                (e.g. ``"2027-CAS-001"``).
+            task_key: Optional override for the task key. Defaults to the
+                Databricks Job task_key; falls back to "unknown" otherwise.
+            source_table: Fully-qualified upstream table, if any.
+            target_table: Fully-qualified downstream table, if any.
+            log_table_path: Override for the exceptions Delta table.
+                Falls back to ``$CENSUS_EXCEPTION_LOG_TABLE`` env var, then
+                to the project default.
+            registry_path: Override for the registry YAML. Defaults to the
+                YAML shipped with this module.
+            batch_size: Records to buffer before auto-flush.
+        """
+        registry = load_registry(registry_path)
+
+        context = build_run_context(
+            collection_instance_id=collection_instance_id,
+            task_key=task_key,
+            source_table=source_table,
+            target_table=target_table,
+        )
+
+        resolved_table = (
+            log_table_path
+            or os.environ.get(_LOG_TABLE_ENV_VAR)
+            or _DEFAULT_LOG_TABLE
+        )
+
+        return cls(
+            spark=spark,
+            registry=registry,
+            context=context,
+            table_path=resolved_table,
+            batch_size=batch_size,
+        )
+
+    # ────────────────────────────────────────────────────────
+    # Public API — single record
+    # ────────────────────────────────────────────────────────
+
+    def log(
+        self,
+        *,
+        rule: str,
+        event_type: str,
+        field: Optional[str] = None,
+        expected: Any = None,
+        observed: Any = None,
+        response_id: Optional[str] = None,
+        message: Optional[str] = None,
+        stack_trace: Optional[str] = None,
+    ) -> None:
+        """
+        Log one validation failure.
+
+        Args:
+            rule: Validation rule key (must exist in the registry).
+            event_type: Event category — e.g. ``"DATACONTRACTVALIDATION"``,
+                ``"coding"``, ``"MI_fix"``, ``"edit"``, ``"imputation"``.
+            field: Name of the offending field, if applicable.
+            expected: Expected value / pattern / range.
+            observed: Observed value.
+            response_id: Primary key of the row, if applicable. ``None``
+                for FILE-level failures.
+            message: Custom human-readable message. If omitted, a default
+                ``"Rule X failed. Expected=..., Observed=..."`` is generated.
+            stack_trace: Traceback string for technical failures. Typically
+                ``traceback.format_exc()`` inside an ``except`` block.
+        """
+        resolved = self._registry.resolve(rule)
+        record = self._build_record(
+            resolved=resolved,
+            event_type=event_type,
+            rule=rule,
+            field=field,
+            expected=expected,
+            observed=observed,
+            response_id=response_id,
+            message=message,
+            stack_trace=stack_trace,
+            timestamp=datetime.now(timezone.utc),
+        )
+        self._add_to_buffer(record)
+
+    # ────────────────────────────────────────────────────────
+    # Public API — bulk
+    # ────────────────────────────────────────────────────────
+
+    def log_many(
+        self,
+        violations: Iterable[Violation],
+        *,
+        event_type: str,
+        response_id: Optional[Union[str, List[str]]] = None,
+        stack_trace: Optional[str] = None,
+    ) -> None:
+        """
+        Log many violations that share an event_type.
+
+        Args:
+            violations: Iterable of Violation instances.
+            event_type: Event category shared by all violations in this batch.
+            response_id: Either a single response_id applied to every
+                violation (common case — all violations relate to the same
+                record, so dwell_nbr / person_nbr is repeated), or a list
+                aligned positionally with ``violations``. ``None`` is valid
+                for FILE-level batches.
+            stack_trace: Optional traceback, shared across all violations.
+
+        Raises:
+            ValueError: if ``response_id`` is a list whose length doesn't
+                match the number of violations.
+        """
+        violations = list(violations)
+
+        # One timestamp per batch, not per record. All violations produced
+        # by a single validation pass should share the same timestamp so
+        # operators can filter "all exceptions from this pass" cleanly.
+        timestamp = datetime.now(timezone.utc)
+
+        # response_id can be a scalar (broadcast to every violation) or a
+        # list aligned positionally. The scalar case is the common one —
+        # most validation passes are scoped to a single record.
+        if isinstance(response_id, list):
+            if len(response_id) != len(violations):
+                raise ValueError(
+                    f"response_id list length ({len(response_id)}) does "
+                    f"not match violation count ({len(violations)})"
+                )
+            response_ids_aligned: List[Optional[str]] = list(response_id)
+        else:
+            response_ids_aligned = [response_id] * len(violations)
+
+        # strict=True raises if the two iterables are different lengths —
+        # defensive check against bugs in the broadcast logic above.
+        for violation, rid in zip(violations, response_ids_aligned, strict=True):
+            resolved = self._registry.resolve(violation.rule)
+            record = self._build_record(
+                resolved=resolved,
+                event_type=event_type,
+                rule=violation.rule,
+                field=violation.field,
+                expected=violation.expected,
+                observed=violation.observed,
+                response_id=rid,
+                message=None,
+                stack_trace=stack_trace,
+                timestamp=timestamp,
+            )
+            self._add_to_buffer(record)
+
+    # ────────────────────────────────────────────────────────
+    # Internal — record assembly
+    # ────────────────────────────────────────────────────────
+
+    def _build_record(
+        self,
+        *,
+        resolved: ResolvedCode,
+        event_type: str,
+        rule: str,
+        field: Optional[str],
+        expected: Any,
+        observed: Any,
+        response_id: Optional[str],
+        message: Optional[str],
+        stack_trace: Optional[str],
+        timestamp: datetime,
+    ) -> dict:
+        """
+        Assemble one Delta-ready record dict. Pure function — no side effects.
+
+        Uses ``self._context_fields()`` (from BaseLogger) for the context
+        columns, then adds exception-specific fields on top.
+        """
+        if message is None:
+            message = (
+                f"Rule '{rule}' failed. "
+                f"Expected={expected!r}, Observed={observed!r}"
+            )
+
+        return {
+            **self._context_fields(),  # run_id, task_key, source/target_table, collection_instance_id
+            "observation_id": str(uuid.uuid4()),
+            "validation_level": resolved.validation_level.value,
+            "event_type": event_type,
+            "error_code": resolved.error_code,
+            "severity": resolved.severity.value,
+            "message": message,
+            "response_id": response_id,
+            "variable_name": field,
+            "is_blocking": resolved.is_blocking,
+            "stack_trace": stack_trace,
+            "created_timestamp_utc": timestamp,
+        }
