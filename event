@@ -225,6 +225,111 @@ class EventLogger(BaseLogger):
         self._add_to_buffer(record)
 
     # ────────────────────────────────────────────────────────
+    # Public API — DataFrame-based bulk logging
+    # ────────────────────────────────────────────────────────
+
+    def log_dataframe(
+        self,
+        df,
+        *,
+        event_type: str,
+        message: Optional[str] = None,
+        rule_name: Optional[str] = None,
+        message_column: Optional[str] = None,
+        response_id_column: Optional[str] = None,
+        variable_name_column: Optional[str] = None,
+    ) -> int:
+        """
+        Log every row of a DataFrame as a separate event record.
+
+        Mirrors :meth:`ExceptionLogger.log_dataframe`. Use when an
+        upstream step produced a DataFrame of events to record (e.g. an
+        imputation step that wants to log one event per row imputed).
+
+        Per-row vs constant fields:
+            * ``message_column``, ``response_id_column``,
+              ``variable_name_column`` — DataFrame column names holding the
+              per-row values.
+            * ``event_type``, ``message`` (constant), ``rule_name`` — same
+              value for every row.
+
+        Either ``message`` (constant) or ``message_column`` (per-row) must
+        be supplied — every event needs a message.
+
+        Args:
+            df: PySpark DataFrame, one row per event.
+            event_type: Event category, applied to every row.
+            message: Constant message. Mutually exclusive with ``message_column``.
+            rule_name: Constant rule_name applied to every row.
+            message_column: DataFrame column holding the message text.
+            response_id_column: DataFrame column holding response_id values.
+            variable_name_column: DataFrame column holding the variable name.
+
+        Returns:
+            Number of records appended to the buffer.
+
+        Raises:
+            ValueError: if neither ``message`` nor ``message_column`` is
+                supplied, if both are supplied, if a referenced column is
+                missing, or if the DataFrame exceeds the safety size limit.
+
+        Performance note:
+            Driver-side iteration via ``.collect()``. Safe for up to
+            ~100k rows. For larger inputs, filter or split first.
+        """
+        if message is None and message_column is None:
+            raise ValueError(
+                "Either `message` (constant) or `message_column` (per-row) "
+                "must be supplied — every event needs a message."
+            )
+        if message is not None and message_column is not None:
+            raise ValueError(
+                "Pass either `message` (constant) or `message_column` "
+                "(per-row), not both."
+            )
+
+        # Validate every referenced column exists.
+        for arg_name, col_name in [
+            ("message_column", message_column),
+            ("response_id_column", response_id_column),
+            ("variable_name_column", variable_name_column),
+        ]:
+            if col_name is not None and col_name not in df.columns:
+                raise ValueError(
+                    f"Column {col_name!r} (passed as {arg_name}) not in "
+                    f"DataFrame. Available columns: {df.columns}"
+                )
+
+        row_count = self._validate_dataframe_size(df)
+        if row_count == 0:
+            return 0
+
+        # One timestamp per call — same reasoning as ExceptionLogger.log_dataframe.
+        timestamp = datetime.now(timezone.utc)
+
+        rows = df.collect()
+        for row in rows:
+            row_dict = row.asDict()
+            record = self._build_record(
+                event_type=event_type,
+                message=(
+                    row_dict[message_column] if message_column else message
+                ),
+                rule_name=rule_name,
+                response_id=(
+                    row_dict[response_id_column] if response_id_column else None
+                ),
+                variable_name=(
+                    row_dict[variable_name_column] if variable_name_column else None
+                ),
+                observation_id=None,            # auto-generated per row
+                created_timestamp_utc=timestamp,  # one timestamp for the batch
+            )
+            self._add_to_buffer(record)
+
+        return row_count
+
+    # ────────────────────────────────────────────────────────
     # Internal — record assembly
     # ────────────────────────────────────────────────────────
 
