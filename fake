@@ -1,0 +1,180 @@
+"""
+Shared test doubles for the logger test suite.
+
+Moving these to a common module means:
+    * test_base_logger.py and test_exception_logger.py (and future
+      test_event_logger.py) all agree on what a "fake Spark" looks like.
+    * A change to the logger's Spark surface — e.g. the base class starts
+      calling a new catalog method — only requires updating one file.
+    * Tests read more cleanly because the fixture plumbing lives elsewhere.
+
+Never import these from production code. They exist only for tests.
+"""
+
+from __future__ import annotations
+
+from pyspark.sql.types import StructType
+
+
+# ─────────────────────────────────────────────
+# FakeDataFrame
+# ─────────────────────────────────────────────
+
+class FakeDataFrame:
+    """
+    Stand-in for a PySpark DataFrame — records the write chain so tests
+    can assert on it without actually writing to Delta.
+
+    The real DataFrame has ``.write`` returning a DataFrameWriter with a
+    chainable ``.mode().format().saveAsTable(...)`` API. Our fake mimics
+    that shape by returning self from each call, so the logger's real
+    write chain works against the fake unchanged.
+    """
+    def __init__(self, rows, schema, raise_on_save: bool = False):
+        self.rows = rows
+        self.schema = schema
+        self.raise_on_save = raise_on_save
+        self._mode: str | None = None
+        self._format: str | None = None
+        self.saved_to: str | None = None
+
+    @property
+    def write(self):
+        return self
+
+    def mode(self, mode: str) -> "FakeDataFrame":
+        self._mode = mode
+        return self
+
+    def format(self, fmt: str) -> "FakeDataFrame":
+        self._format = fmt
+        return self
+
+    def saveAsTable(self, table_path: str) -> None:  # noqa: N802 — mimics Spark API
+        if self.raise_on_save:
+            raise RuntimeError("simulated Spark write failure")
+        self.saved_to = table_path
+
+
+# ─────────────────────────────────────────────
+# FakeCatalog / FakeTable
+# ─────────────────────────────────────────────
+
+class FakeCatalog:
+    """Stand-in for ``spark.catalog``. Remembers which tables exist."""
+
+    def __init__(self):
+        self._tables: dict[str, StructType] = {}
+
+    def register(self, table_path: str, schema: StructType) -> None:
+        """Simulate a table with this schema existing in the metastore."""
+        self._tables[table_path] = schema
+
+    def tableExists(self, table_path: str) -> bool:  # noqa: N802 — mimics Spark API
+        return table_path in self._tables
+
+    def schema_for(self, table_path: str) -> StructType:
+        return self._tables[table_path]
+
+
+class FakeTable:
+    """Minimal stand-in for the DataFrame returned by ``spark.table()``."""
+    def __init__(self, schema: StructType):
+        self.schema = schema
+
+
+# ─────────────────────────────────────────────
+# FakeSpark
+# ─────────────────────────────────────────────
+
+class FakeSpark:
+    """
+    Stand-in SparkSession. Carries a FakeCatalog so the logger's
+    table-contract validation can run without Databricks, and records
+    every DataFrame created so tests can inspect writes.
+
+    Failure-injection flags:
+        raise_on_create: simulate ``createDataFrame`` failing.
+        raise_on_save:   simulate the Delta write failing.
+    """
+    def __init__(self, raise_on_create: bool = False, raise_on_save: bool = False):
+        self.raise_on_create = raise_on_create
+        self.raise_on_save = raise_on_save
+        self.created: list[FakeDataFrame] = []
+        self.catalog = FakeCatalog()
+
+    def createDataFrame(self, rows, schema):  # noqa: N802 — mimics Spark API
+        if self.raise_on_create:
+            raise RuntimeError("simulated createDataFrame failure")
+        df = FakeDataFrame(list(rows), schema, raise_on_save=self.raise_on_save)
+        self.created.append(df)
+        return df
+
+    def table(self, table_path: str) -> FakeTable:
+        return FakeTable(self.catalog.schema_for(table_path))
+
+
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+
+def make_spark_with_table(
+    table_path: str,
+    schema: StructType,
+    *,
+    raise_on_create: bool = False,
+    raise_on_save: bool = False,
+) -> FakeSpark:
+    """
+    Return a FakeSpark with one table pre-registered. Saves every test
+    from the boilerplate of creating the spark, then registering the table.
+
+    For tests that need multiple tables registered, call this once and
+    then ``spark.catalog.register(...)`` additional paths.
+    """
+    spark = FakeSpark(raise_on_create=raise_on_create, raise_on_save=raise_on_save)
+    spark.catalog.register(table_path, schema)
+    return spark
+
+
+# ─────────────────────────────────────────────
+# FakeInputDataFrame — for testing log_dataframe
+# ─────────────────────────────────────────────
+
+class FakeRow:
+    """
+    Stand-in for a pyspark.sql.Row. Supports the .asDict() method used
+    by log_dataframe to convert each row to a plain Python dict.
+    """
+    def __init__(self, **fields):
+        self._fields = fields
+
+    def asDict(self) -> dict:  # noqa: N802 — mimics Spark API
+        return dict(self._fields)
+
+
+class FakeInputDataFrame:
+    """
+    Stand-in for the DataFrame argument to ``log_dataframe``.
+
+    Implements just enough surface — ``columns``, ``count()``, ``collect()``
+    — for the logger's iteration logic to work without a real SparkSession.
+
+    Usage:
+        df = FakeInputDataFrame(
+            columns=["response_id", "observed"],
+            rows=[
+                {"response_id": "P1", "observed": 1899},
+                {"response_id": "P2", "observed": 2050},
+            ],
+        )
+    """
+    def __init__(self, columns: list[str], rows: list[dict]):
+        self.columns = columns
+        self._rows = rows
+
+    def count(self) -> int:
+        return len(self._rows)
+
+    def collect(self) -> list[FakeRow]:
+        return [FakeRow(**row) for row in self._rows]
