@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from tests.unit._fakes import FakeSpark
+from tests.unit._fakes import FakeInputDataFrame, FakeSpark
 from utils.logger.context import RunContext
 from utils.logger.event_logger import EventLogger
 
@@ -300,3 +300,148 @@ def test_for_task_builds_logger_with_resolved_defaults(run_context: RunContext):
     logger.flush()
 
     assert len(spark.created) == 1
+
+
+# ─────────────────────────────────────────────
+# log_dataframe
+# ─────────────────────────────────────────────
+
+def test_log_dataframe_creates_one_record_per_row(logger: EventLogger):
+    """
+    Driving an event log from a DataFrame — e.g. an imputation step that
+    produced a result DataFrame and now wants to log one event per row.
+    """
+    df = FakeInputDataFrame(
+        columns=["response_id", "msg"],
+        rows=[
+            {"response_id": "P-001", "msg": "imputed dob from age"},
+            {"response_id": "P-002", "msg": "imputed dob from siblings"},
+        ],
+    )
+
+    written = logger.log_dataframe(
+        df,
+        event_type="imputation",
+        rule_name="dob_imputation_v1",
+        message_column="msg",
+        response_id_column="response_id",
+    )
+
+    assert written == 2
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    rows = spark.created[0].rows
+
+    assert len(rows) == 2
+    assert rows[0]["response_id"] == "P-001"
+    assert rows[0]["message"] == "imputed dob from age"
+    assert rows[0]["rule_name"] == "dob_imputation_v1"
+    assert rows[1]["response_id"] == "P-002"
+    assert rows[1]["message"] == "imputed dob from siblings"
+
+
+def test_log_dataframe_with_constant_message(logger: EventLogger):
+    """
+    Constant `message` applied to every row — no message_column needed.
+    """
+    df = FakeInputDataFrame(
+        columns=["response_id"],
+        rows=[{"response_id": f"P-{i}"} for i in range(3)],
+    )
+
+    logger.log_dataframe(
+        df,
+        event_type="coding",
+        message="Coded successfully",
+        response_id_column="response_id",
+    )
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    rows = spark.created[0].rows
+    assert all(r["message"] == "Coded successfully" for r in rows)
+
+
+def test_log_dataframe_requires_message_or_message_column(logger: EventLogger):
+    """Every event needs a message — neither supplied is a programming error."""
+    df = FakeInputDataFrame(columns=["response_id"], rows=[{"response_id": "P-1"}])
+
+    with pytest.raises(ValueError, match="every event needs a message"):
+        logger.log_dataframe(
+            df,
+            event_type="coding",
+            response_id_column="response_id",
+        )
+
+
+def test_log_dataframe_rejects_message_and_message_column_both_set(
+    logger: EventLogger,
+):
+    """Both supplied is ambiguous — pick one."""
+    df = FakeInputDataFrame(
+        columns=["response_id", "msg"],
+        rows=[{"response_id": "P-1", "msg": "foo"}],
+    )
+
+    with pytest.raises(ValueError, match="not both"):
+        logger.log_dataframe(
+            df,
+            event_type="coding",
+            message="constant",
+            message_column="msg",
+            response_id_column="response_id",
+        )
+
+
+def test_log_dataframe_shares_one_timestamp(logger: EventLogger):
+    """All rows in one log_dataframe call must share a created_timestamp_utc."""
+    df = FakeInputDataFrame(
+        columns=["response_id"],
+        rows=[{"response_id": f"P-{i}"} for i in range(5)],
+    )
+
+    logger.log_dataframe(
+        df,
+        event_type="coding",
+        message="constant",
+        response_id_column="response_id",
+    )
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    rows = spark.created[0].rows
+    timestamps = {r["created_timestamp_utc"] for r in rows}
+    assert len(timestamps) == 1
+
+
+def test_log_dataframe_empty_input_is_noop(logger: EventLogger):
+    """An empty DataFrame should return 0 and not push anything to the buffer."""
+    df = FakeInputDataFrame(columns=["response_id"], rows=[])
+
+    written = logger.log_dataframe(
+        df,
+        event_type="coding",
+        message="constant",
+        response_id_column="response_id",
+    )
+
+    assert written == 0
+    assert logger.buffer_size == 0
+
+
+def test_log_dataframe_rejects_oversized_input(logger: EventLogger):
+    """The 100k-row safety limit applies to events too."""
+    logger.DATAFRAME_ROW_LIMIT = 3
+    df = FakeInputDataFrame(
+        columns=["response_id"],
+        rows=[{"response_id": f"P-{i}"} for i in range(5)],
+    )
+
+    with pytest.raises(ValueError, match="exceeding the safety limit"):
+        logger.log_dataframe(
+            df,
+            event_type="coding",
+            message="constant",
+            response_id_column="response_id",
+        )
