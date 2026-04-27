@@ -1,0 +1,37 @@
+Caller examples — quick reference
+
+  ExceptionLogger:
+# A typical PySpark validation pass produces a DataFrame of failures.
+failing = (
+    individual_df
+    .filter((F.col("dob_year") < 1900) | (F.col("dob_year") > 2026))
+    .select("response_id", F.col("dob_year").alias("observed"))
+)
+
+with ExceptionLogger.for_task(spark=spark, ...) as logger:
+    logger.log_dataframe(
+        failing,
+        rule="value_out_of_range",
+        event_type="DATACONTRACTVALIDATION",
+        field="dob_year",                       # constant — same field for every row
+        expected="1900-2026",
+        response_id_column="response_id",       # column in df → record's response_id
+        observed_column="observed",             # column in df → record's observed
+    )
+
+  
+# Imputation step produces results with per-row reasons.
+imputations = (
+    df
+    .filter(F.col("imputation_applied") == True)
+    .select("response_id", F.col("reason").alias("msg"))
+)
+
+with EventLogger.for_task(spark=spark, ...) as logger:
+    logger.log_dataframe(
+        imputations,
+        event_type="imputation",
+        rule_name="dob_imputation_v1",
+        message_column="msg",
+        response_id_column="response_id",
+    )
