@@ -234,6 +234,41 @@ class BaseLogger(ABC):
         }
 
     # ────────────────────────────────────────────────────────
+    # Protected helpers for DataFrame-based logging
+    # ────────────────────────────────────────────────────────
+
+    # Driver-memory safeguard for log_dataframe paths in subclasses.
+    # The collect()-then-iterate pattern is fine for tens of thousands of
+    # rows but unsafe at millions — every row sits in driver memory before
+    # the first flush. This cap is conservative; large-scale callers should
+    # filter their DataFrame down to actual failures before passing it in.
+    DATAFRAME_ROW_LIMIT: int = 100_000
+
+    def _validate_dataframe_size(self, df) -> int:
+        """
+        Confirm the DataFrame is small enough to safely collect to driver.
+
+        Returns the row count so subclasses can short-circuit on empty input
+        without re-counting. Raises ValueError if the DataFrame is too big.
+
+        Why .count() before .collect():
+            ``.count()`` is a single-pass aggregation that runs on the cluster
+            and returns a number — far cheaper than ``.collect()`` for a
+            DataFrame that turns out to be too big. Catching the size
+            mismatch before we pull any rows is safer than realising mid-
+            collect that we're about to OOM the driver.
+        """
+        row_count = df.count()
+        if row_count > self.DATAFRAME_ROW_LIMIT:
+            raise ValueError(
+                f"DataFrame has {row_count:,} rows, exceeding the safety "
+                f"limit of {self.DATAFRAME_ROW_LIMIT:,}. Filter the input "
+                f"to actual failures, or split into smaller batches before "
+                f"calling log_dataframe()."
+            )
+        return row_count
+
+    # ────────────────────────────────────────────────────────
     # Internal — table contract validation
     # ────────────────────────────────────────────────────────
 
