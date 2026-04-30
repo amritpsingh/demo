@@ -1,0 +1,515 @@
+below is the consolidated list of all modifications and improvements we have decided to make across the whole discussion.
+I’ve grouped them into:
+
+Final API decisions
+Method signature / parameter changes
+Schema / table changes
+Object model changes
+Behavioral changes
+Documentation / examples / cleanup
+Items explicitly not being changed right now
+Implementation order recommendation
+
+This should serve as the final design baseline before implementation.
+
+1) Final API Decisions
+ExceptionLogger — keep all 3 methods
+We decided to keep:
+
+log()
+log_many()
+log_dataframe()
+
+Why
+Because ExceptionLogger supports three legitimate input shapes:
+
+single technical / validation exception → log()
+multiple violations for one logical record → log_many()
+table-wide Spark validation failures in a DataFrame → log_dataframe()
+
+
+EventLogger — keep single + optional bulk DataFrame
+We decided to keep:
+
+log()
+log_dataframe() (only if bulk event logging is needed)
+
+And:
+
+do not add log_many() to EventLogger
+
+Why
+Because the main event use cases are:
+
+one event at a time
+or bulk events via DataFrame if needed
+
+A separate log_many() for events was judged unnecessary.
+
+Rename EventLogger.log_event() to log()
+We decided to standardize the single-record event method name:
+
+EventLogger.log_event() → EventLogger.log()
+
+Why
+To make method naming consistent with ExceptionLogger.log().
+
+2) Method Signature / Parameter Changes
+
+2.1 Standardize on variable_name
+We decided that the public API should use:
+
+variable_name
+
+instead of:
+
+field
+
+Applies to
+
+ExceptionLogger.log()
+ExceptionLogger.log_many() / Violation
+ExceptionLogger.log_dataframe()
+docs/examples/tests
+
+Why
+The team already uses variable_name, so we align with established terminology.
+
+2.2 Keep variable_name_column in log_dataframe()
+We decided to keep:
+
+variable_name
+variable_name_column
+
+in log_dataframe()
+Why
+They represent two different valid validation output shapes:
+A. Constant variable_name
+For one-field-at-a-time validation:
+
+null check on i_mode
+range check on i_age
+
+B. variable_name_column
+For normalized/generic validation outputs where one failure DataFrame contains failures for different variables:
+
+person_nbr null
+i_mode null
+i_id null
+
+Important naming decision
+We decided not to rename variable_name_column to variable_column_names.
+Why
+variable_name_column is more accurate:
+
+the parameter is the name of one DataFrame column
+that DataFrame column contains variable names
+
+
+2.3 response_id vs response_id_column
+We decided that in log_dataframe() we will keep only:
+
+response_id_column
+
+and not keep constant response_id in log_dataframe().
+Why
+In table/bulk validation use cases, response_id is naturally row-specific, not constant.
+This applies to both:
+
+one-variable-at-a-time validations
+normalized multi-variable validations
+
+Final rule
+
+log() / log_many() → response_id = actual value
+log_dataframe() → response_id_column = name of DataFrame column containing response IDs
+
+
+2.4 observed vs observed_column
+We decided that in log_dataframe() we will keep only:
+
+observed_column
+
+and not keep constant observed in log_dataframe().
+Why
+For DataFrame/table validation, observed values are row-specific and should come from the DataFrame.
+Final rule
+
+log() / log_many() → observed = actual observed value
+log_dataframe() → observed_column = name of DataFrame column containing observed values
+
+
+2.5 expected stays constant in log_dataframe()
+We decided to keep:
+
+expected
+
+as a constant in log_dataframe()
+and not add / use:
+
+expected_column (for now)
+
+Why
+For most validation rules, expected is naturally constant across the whole validation call:
+
+"non-null"
+"0..120"
+"Online | Phone | Visit"
+"iso-8601"
+
+Adding expected_column now would make common validations unnecessarily more complex.
+
+2.6 rule vs rule_name stays as-is
+We decided to keep the distinction:
+
+ExceptionLogger → rule
+EventLogger → rule_name
+
+Why
+They are semantically different:
+
+rule = registry-backed validation rule key
+rule_name = free-text event/business rule name
+
+This is an intentional difference and should be documented clearly.
+
+2.7 log_many() simplified to one logical record
+We decided to simplify ExceptionLogger.log_many() so that:
+
+response_id is scalar only
+remove support for response_id as a list
+
+Final shape
+log_many() is now explicitly:
+
+multiple violations for one logical record / one shared response_id
+
+Why
+If failures span many response IDs, that is a log_dataframe() use case.
+
+2.8 EventLogger log_dataframe() should support message and message_column
+We decided for EventLogger.log_dataframe() to keep both:
+
+message
+message_column
+
+with mutual exclusivity.
+Why
+Both are valid bulk event patterns:
+A. message
+When every row represents the same event message
+B. message_column
+When each row has its own event message
+Decision
+We will not overload message to sometimes mean a literal and sometimes mean a DataFrame column selector.
+That would be too confusing.
+
+2.9 EventLogger log_dataframe() should use response_id_column
+For EventLogger bulk logging, we decided to use:
+
+response_id_column
+
+rather than constant response_id
+Why
+Bulk event rows are also table/dataframe-driven and should use row-level identity from a column.
+
+2.10 EventLogger may also support variable_name / variable_name_column
+We agreed that if EventLogger.log_dataframe() is kept, it may also support:
+
+variable_name
+variable_name_column
+
+when needed
+Why
+Some bulk event rows may all relate to one variable, while others may be generic event rows spanning multiple variables.
+
+3) Schema / Table Changes
+3.1 Add expected and observed columns to the exceptions log table
+We decided to add structured columns to the exceptions table/schema:
+
+expected
+observed
+
+Why
+Right now these values are mostly embedded in the message.
+Adding them as columns makes the exceptions table more queryable and more useful analytically.
+Expected representation
+These should likely be stored as nullable strings.
+
+3.2 Update ExceptionLogger._SCHEMA
+Because of the above, ExceptionLogger._SCHEMA must be updated to include:
+
+expected
+observed
+
+And record assembly must populate them.
+
+3.3 Table migration / DDL change required
+Because the schema changes affect the target Delta table, we will need:
+
+migration / DDL update for the exceptions table
+
+This is not just a Python change
+It must be reflected in the physical target table too.
+
+4) Object Model Changes
+4.1 Add message to Violation
+We decided to use Option 2 for Violation:
+Add optional:
+
+message
+
+New conceptual shape
+Violation will contain:
+
+rule
+variable_name
+expected
+observed
+message (optional)
+
+Why
+Different violations in one batch may need different human-readable messages.
+So message belongs on each violation, not as one shared log_many() parameter.
+
+5) Behavioral Changes
+5.1 Framework-managed observation_id everywhere
+We decided to keep observation_id:
+
+always auto-generated
+not caller-supplied publicly
+
+Applies especially to EventLogger
+We decided to remove the public override behavior from EventLogger.log() for:
+
+observation_id
+
+Why
+This keeps the API simpler and consistent across both loggers.
+
+5.2 Framework-managed timestamps everywhere
+We decided to keep timestamps:
+
+always auto-generated by the logger
+not caller-supplied publicly
+
+Applies especially to EventLogger
+We decided to remove the public override behavior from EventLogger.log() for:
+
+created_timestamp_utc
+
+Why
+Consistent behavior across both loggers and less API clutter.
+
+5.3 Keep using uuid.uuid4() for now (not UUIDv7)
+We decided to stick with uuid.uuid4() for now rather than moving to UUIDv7.
+Why
+
+uuid.uuid7() is documented in the Python 3.14 standard library docs, so it should not be assumed available in older Python environments. [docs.python.org]
+Databricks documentation does not suggest that uuid6 / uuid-utils are universally preinstalled defaults, so introducing UUIDv7 via third-party package would require explicit dependency management. [docs.databricks.com], [docs.databricks.com], [learn.microsoft.com]
+
+Final decision
+
+keep uuid.uuid4() now
+revisit UUIDv7 later only if there is a strong operational reason
+
+
+6) Documentation / Examples / Cleanup
+6.1 Standardize terminology in docstrings and examples
+We decided documentation needs a full consistency pass.
+Replace old terminology
+
+field → variable_name
+field_column → variable_name_column
+log_event() examples → log()
+
+Keep intentional differences documented
+
+rule vs rule_name
+
+
+6.2 Update notebook examples
+We decided notebook/demo examples should be updated to reflect the final API.
+Especially:
+
+EventLogger.log_event() → EventLogger.log()
+variable_name usage everywhere
+log_dataframe() examples using:
+
+response_id_column
+observed_column
+variable_name / variable_name_column
+message_column where relevant
+
+
+
+
+6.3 Improve method docstrings
+We decided docstrings should clearly explain:
+For ExceptionLogger.log_dataframe()
+
+when to use variable_name
+when to use variable_name_column
+that response_id_column is a DataFrame column selector
+that observed_column is a DataFrame column selector
+that expected is constant for the validation call
+
+For EventLogger.log_dataframe()
+
+message vs message_column
+response_id_column
+optional variable_name vs variable_name_column
+
+
+7) Items Explicitly Not Being Changed Right Now
+These are important so implementation doesn’t drift.
+
+7.1 No log_many() for EventLogger
+We explicitly decided:
+
+do not add log_many() to EventLogger
+
+
+7.2 No expected_column for now
+We explicitly decided:
+
+do not add expected_column right now
+
+Because most current validations have a constant expected value.
+
+7.3 No overloaded response_id / observed in log_dataframe()
+We explicitly decided:
+
+do not overload response_id in log_dataframe()
+do not overload observed in log_dataframe()
+
+Instead, use:
+
+response_id_column
+observed_column
+
+
+7.4 Do not rename variable_name_column
+We explicitly decided:
+
+keep variable_name_column
+do not rename to variable_column_names
+
+
+7.5 No UUIDv7 migration right now
+We explicitly decided:
+
+stay on uuid.uuid4() for now
+
+
+7.6 Return type behavior stays unchanged for now
+We did not finalize a change to make all methods return counts.
+So for now, the safe assumption is:
+
+keep existing return behavior unless implementation reveals a compelling reason to change it
+
+Meaning
+This is effectively a deferred / no-change item for now.
+
+8) Consolidated Final Target by Class
+
+ExceptionLogger — final target shape
+Keep methods
+
+log()
+log_many()
+log_dataframe()
+
+log()
+Use:
+
+rule
+event_type
+variable_name
+expected
+observed
+response_id
+message
+stack_trace
+
+log_many()
+Use:
+
+violations
+event_type
+response_id (scalar only)
+stack_trace
+
+log_dataframe()
+Use:
+
+rule
+event_type
+variable_name
+variable_name_column
+expected
+response_id_column
+observed_column
+message
+stack_trace
+
+Rules
+
+either variable_name or variable_name_column, not both
+expected constant only
+response_id_column row-based
+observed_column row-based
+message constant only
+
+Schema changes
+Add:
+
+expected
+observed
+
+Violation changes
+Add:
+
+optional message
+
+
+EventLogger — final target shape
+Keep methods
+
+log()
+log_dataframe() (if bulk event logging is needed)
+
+Rename
+
+log_event() → log()
+
+log()
+Use:
+
+event_type
+message
+rule_name
+response_id
+variable_name
+
+And:
+
+no public observation_id override
+no public timestamp override
+
+log_dataframe()
+Use:
+
+event_type
+message
+message_column
+rule_name
+response_id_column
+variable_name
+variable_name_column (if needed)
+
+Rules
+
+either message or message_column, not both
+response_id_column for row identity
+variable_name or variable_name_column depending on bulk event shape
