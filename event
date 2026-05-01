@@ -19,7 +19,7 @@ Caller-facing surface (intentionally tiny):
         source_table="socpophousdata1_dev.social_census_parsed.individual",
         target_table="socpophousdata1_dev.social_census_classified.individual",
     ) as logger:
-        logger.log_event(
+        logger.log(
             event_type="coding",
             message="Applied ethnic group coding rules successfully",
             rule_name="ethnic_group_coding_v1",
@@ -47,10 +47,6 @@ from utils.logger.base_logger import BaseLogger
 from utils.logger.context import RunContext, build_run_context
 
 
-# Default events Delta table. Override per-task via the ``log_table_path``
-# argument to for_task(), or globally via the environment variable below.
-# Higher default batch size than ExceptionLogger (events are more numerous
-# per task; buffering more keeps write overhead proportional).
 _LOG_TABLE_ENV_VAR = "CENSUS_EVENT_LOG_TABLE"
 _DEFAULT_LOG_TABLE = "socpophousdata1_dev.social_census_logs.events"
 
@@ -65,10 +61,6 @@ class EventLogger(BaseLogger):
     :meth:`EventLogger.for_task`.
     """
 
-    # Schema mirrors the spec's events table. Shares most columns with
-    # ExceptionLogger but lacks the governance fields (validation_level,
-    # error_code, severity, is_blocking, stack_trace) and has a free-text
-    # ``rule_name`` in their place.
     _SCHEMA: StructType = StructType([
         StructField("observation_id", StringType(), False),
         StructField("run_id", StringType(), False),
@@ -105,17 +97,7 @@ class EventLogger(BaseLogger):
 
         Most callers should use :meth:`for_task` instead — it wires up
         the context and default table path automatically.
-
-        Args:
-            spark: Active SparkSession.
-            context: RunContext — run_id, task_key, source_table, etc.
-            table_path: Fully-qualified events Delta table.
-            batch_size: Records to buffer before auto-flush.
         """
-        # Delegate buffering, flushing, context-manager, and table-contract
-        # validation to the base. EventLogger has no registry or other
-        # subclass-specific state, so there's nothing to add after the
-        # super() call.
         super().__init__(
             spark=spark,
             context=context,
@@ -144,19 +126,6 @@ class EventLogger(BaseLogger):
 
         Mirrors :meth:`ExceptionLogger.for_task`. The resulting logger is
         a context manager — use it inside a ``with`` block.
-
-        Args:
-            spark: Active SparkSession.
-            collection_instance_id: Sub-operation the data relates to
-                (e.g. ``"2027-CAS-001"``).
-            task_key: Optional override for the task key. Defaults to
-                the Databricks Job task_key; falls back to "unknown".
-            source_table: Fully-qualified upstream table, if any.
-            target_table: Fully-qualified downstream table, if any.
-            log_table_path: Override for the events Delta table.
-                Falls back to ``$CENSUS_EVENT_LOG_TABLE`` env var, then
-                to the project default.
-            batch_size: Records to buffer before auto-flush.
         """
         context = build_run_context(
             collection_instance_id=collection_instance_id,
@@ -179,10 +148,10 @@ class EventLogger(BaseLogger):
         )
 
     # ────────────────────────────────────────────────────────
-    # Public API
+    # Public API — single record
     # ────────────────────────────────────────────────────────
 
-    def log_event(
+    def log(
         self,
         *,
         event_type: str,
@@ -190,14 +159,9 @@ class EventLogger(BaseLogger):
         rule_name: Optional[str] = None,
         response_id: Optional[str] = None,
         variable_name: Optional[str] = None,
-        observation_id: Optional[str] = None,
-        created_timestamp_utc: Optional[datetime] = None,
     ) -> None:
         """
         Log one observation event.
-
-        Keyword-only — too many fields for positional to stay readable,
-        and kwargs guard against silent reordering.
 
         Args:
             event_type: Event category — e.g. ``"coding"``, ``"MI_fix"``,
@@ -208,10 +172,6 @@ class EventLogger(BaseLogger):
                 exist in the registry).
             response_id: Primary key of the row being observed, if any.
             variable_name: The name of the variable being processed.
-            observation_id: Override for the auto-generated observation_id.
-                Useful when the event corresponds to a known upstream ID.
-            created_timestamp_utc: Override for the auto-generated timestamp.
-                Useful for backfilling events with their original time.
         """
         record = self._build_record(
             event_type=event_type,
@@ -219,8 +179,7 @@ class EventLogger(BaseLogger):
             rule_name=rule_name,
             response_id=response_id,
             variable_name=variable_name,
-            observation_id=observation_id,
-            created_timestamp_utc=created_timestamp_utc,
+            timestamp=datetime.now(timezone.utc),
         )
         self._add_to_buffer(record)
 
@@ -233,36 +192,53 @@ class EventLogger(BaseLogger):
         df,
         *,
         event_type: str,
-        message: Optional[str] = None,
         rule_name: Optional[str] = None,
+        message: Optional[str] = None,
         message_column: Optional[str] = None,
-        response_id_column: Optional[str] = None,
+        response_id_column: str,
+        variable_name: Optional[str] = None,
         variable_name_column: Optional[str] = None,
     ) -> int:
         """
         Log every row of a DataFrame as a separate event record.
 
-        Mirrors :meth:`ExceptionLogger.log_dataframe`. Use when an
-        upstream step produced a DataFrame of events to record (e.g. an
-        imputation step that wants to log one event per row imputed).
+        Mirrors :meth:`ExceptionLogger.log_dataframe`. Use when an upstream
+        step produced a DataFrame of events to record (e.g. an imputation
+        step that wants to log one event per row imputed).
 
         Per-row vs constant fields:
-            * ``message_column``, ``response_id_column``,
-              ``variable_name_column`` — DataFrame column names holding the
-              per-row values.
-            * ``event_type``, ``message`` (constant), ``rule_name`` — same
-              value for every row.
+            Per-row (DataFrame columns):
+                ``response_id_column`` (required), and optionally
+                ``message_column`` and ``variable_name_column``.
+            Constant for the whole call:
+                ``event_type``, ``rule_name``, and (constant)
+                ``message`` and ``variable_name``.
 
-        Either ``message`` (constant) or ``message_column`` (per-row) must
-        be supplied — every event needs a message.
+        Message shape:
+            * Pass ``message="constant text"`` when every row represents
+              the same event message.
+            * Pass ``message_column="msg"`` when each row has its own
+              message text in a DataFrame column.
+            Pass exactly one of these.
+
+        Variable-name shape:
+            * Pass ``variable_name="dob_year"`` when every row relates to
+              the same variable.
+            * Pass ``variable_name_column="variable"`` when rows span
+              multiple variables.
+            * Pass neither when the events aren't variable-scoped.
 
         Args:
             df: PySpark DataFrame, one row per event.
             event_type: Event category, applied to every row.
-            message: Constant message. Mutually exclusive with ``message_column``.
             rule_name: Constant rule_name applied to every row.
+            message: Constant message text. Mutually exclusive with
+                ``message_column``.
             message_column: DataFrame column holding the message text.
             response_id_column: DataFrame column holding response_id values.
+                Required — bulk events are row-scoped.
+            variable_name: Constant variable name. Mutually exclusive with
+                ``variable_name_column``.
             variable_name_column: DataFrame column holding the variable name.
 
         Returns:
@@ -270,8 +246,10 @@ class EventLogger(BaseLogger):
 
         Raises:
             ValueError: if neither ``message`` nor ``message_column`` is
-                supplied, if both are supplied, if a referenced column is
-                missing, or if the DataFrame exceeds the safety size limit.
+                supplied, if both are supplied, if both ``variable_name``
+                and ``variable_name_column`` are supplied, if a referenced
+                column is missing, or if the DataFrame exceeds the safety
+                size limit.
 
         Performance note:
             Driver-side iteration via ``.collect()``. Safe for up to
@@ -287,8 +265,12 @@ class EventLogger(BaseLogger):
                 "Pass either `message` (constant) or `message_column` "
                 "(per-row), not both."
             )
+        if variable_name is not None and variable_name_column is not None:
+            raise ValueError(
+                "Pass either `variable_name` (constant) or "
+                "`variable_name_column` (per-row), not both."
+            )
 
-        # Validate every referenced column exists.
         for arg_name, col_name in [
             ("message_column", message_column),
             ("response_id_column", response_id_column),
@@ -304,7 +286,6 @@ class EventLogger(BaseLogger):
         if row_count == 0:
             return 0
 
-        # One timestamp per call — same reasoning as ExceptionLogger.log_dataframe.
         timestamp = datetime.now(timezone.utc)
 
         rows = df.collect()
@@ -316,14 +297,13 @@ class EventLogger(BaseLogger):
                     row_dict[message_column] if message_column else message
                 ),
                 rule_name=rule_name,
-                response_id=(
-                    row_dict[response_id_column] if response_id_column else None
-                ),
+                response_id=row_dict[response_id_column],
                 variable_name=(
-                    row_dict[variable_name_column] if variable_name_column else None
+                    row_dict[variable_name_column]
+                    if variable_name_column
+                    else variable_name
                 ),
-                observation_id=None,            # auto-generated per row
-                created_timestamp_utc=timestamp,  # one timestamp for the batch
+                timestamp=timestamp,
             )
             self._add_to_buffer(record)
 
@@ -341,22 +321,21 @@ class EventLogger(BaseLogger):
         rule_name: Optional[str],
         response_id: Optional[str],
         variable_name: Optional[str],
-        observation_id: Optional[str],
-        created_timestamp_utc: Optional[datetime],
+        timestamp: datetime,
     ) -> dict:
         """
         Assemble one Delta-ready record dict. Pure function — no side effects.
 
-        Uses ``self._context_fields()`` (from BaseLogger) for the context
-        columns, then adds event-specific fields on top.
+        observation_id and timestamp are framework-managed — both
+        auto-generated, never accepted from public callers.
         """
         return {
-            **self._context_fields(),  # run_id, task_key, source/target_table, collection_instance_id
-            "observation_id": observation_id or str(uuid.uuid4()),
+            **self._context_fields(),
+            "observation_id": str(uuid.uuid4()),
             "event_type": event_type,
             "rule_name": rule_name,
             "message": message,
             "response_id": response_id,
             "variable_name": variable_name,
-            "created_timestamp_utc": created_timestamp_utc or datetime.now(timezone.utc),
+            "created_timestamp_utc": timestamp,
         }
