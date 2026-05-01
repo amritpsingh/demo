@@ -1,0 +1,82 @@
+-- Logger tables migration — drop and recreate with the v2 schema.
+--
+-- Run once per environment. Safe because the logger module is still in
+-- development and the tables hold no production data.
+--
+-- Changes from v1 (compared to whatever's in place now):
+--   * exceptions table: added `expected` and `observed` columns.
+--     Both are STRING — values get _to_loggable()-converted in the logger
+--     (primitives → str(), structures → json.dumps()). Operators query
+--     primitives with `WHERE observed = '1899'`, structures with
+--     `WHERE parse_json(observed):min = 0`.
+--   * Both tables now include `job_id` (added in a prior migration).
+--
+-- Naming: replace `socpophousdata1_dev` with the catalog for your target
+-- environment (`socpophousdata1_tst`, `_uat`, `_prd`).
+
+-- ────────────────────────────────────────────────────────────────
+-- Schema (idempotent — only created if missing)
+-- ────────────────────────────────────────────────────────────────
+CREATE SCHEMA IF NOT EXISTS socpophousdata1_dev.social_census_logs;
+
+
+-- ────────────────────────────────────────────────────────────────
+-- Exceptions table
+-- ────────────────────────────────────────────────────────────────
+DROP TABLE IF EXISTS socpophousdata1_dev.social_census_logs.exceptions;
+
+CREATE TABLE socpophousdata1_dev.social_census_logs.exceptions (
+    observation_id         STRING    NOT NULL,
+    run_id                 STRING    NOT NULL,
+    job_id                 STRING,
+    task_key               STRING    NOT NULL,
+    source_table           STRING,
+    target_table           STRING,
+    validation_level       STRING    NOT NULL,
+    event_type             STRING    NOT NULL,
+    error_code             STRING    NOT NULL,
+    severity               STRING    NOT NULL,
+    message                STRING,
+    expected               STRING,
+    observed               STRING,
+    response_id            STRING,
+    collection_instance_id STRING,
+    variable_name          STRING,
+    is_blocking            BOOLEAN   NOT NULL,
+    stack_trace            STRING,
+    created_timestamp_utc  TIMESTAMP NOT NULL
+)
+USING DELTA
+COMMENT 'Data contract technical validation failures and technical errors. '
+        'Written by ExceptionLogger.'
+TBLPROPERTIES (
+    'delta.enableChangeDataFeed' = 'false'
+);
+
+
+-- ────────────────────────────────────────────────────────────────
+-- Events table
+-- ────────────────────────────────────────────────────────────────
+DROP TABLE IF EXISTS socpophousdata1_dev.social_census_logs.events;
+
+CREATE TABLE socpophousdata1_dev.social_census_logs.events (
+    observation_id         STRING    NOT NULL,
+    run_id                 STRING    NOT NULL,
+    job_id                 STRING,
+    task_key               STRING    NOT NULL,
+    source_table           STRING,
+    target_table           STRING,
+    event_type             STRING    NOT NULL,
+    rule_name              STRING,
+    message                STRING,
+    response_id            STRING,
+    collection_instance_id STRING,
+    variable_name          STRING,
+    created_timestamp_utc  TIMESTAMP NOT NULL
+)
+USING DELTA
+COMMENT 'Non-fatal observation events during Census processing — coding, '
+        'imputation, manual interventions, etc. Written by EventLogger.'
+TBLPROPERTIES (
+    'delta.enableChangeDataFeed' = 'false'
+);
