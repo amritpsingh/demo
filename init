@@ -1,0 +1,78 @@
+"""
+Structured logging for Data Contract Technical Validation failures and other
+observed events during Combined Census Processing.
+
+Public API:
+
+    ExceptionLogger       — buffered writer for the exceptions Delta table
+    EventLogger           — buffered writer for the events Delta table
+    Violation             — dataclass for bulk-logging validation failures
+    RunContext            — immutable per-task context (usually built automatically)
+    build_run_context     — factory for RunContext, with Databricks job integration
+    ValidationLevel       — FILE / RECORD / FIELD / VALUE enum
+    Severity              — ERROR / WARNING / INFO enum
+    load_registry         — cached loader for the error code registry YAML
+    RegistryLoadError     — raised on registry load/validate failure
+    TableContractError    — raised on table-contract mismatch at logger construction
+
+Typical use — ExceptionLogger (validation failures):
+
+    from utils.logger import ExceptionLogger
+
+    with ExceptionLogger.for_task(
+        spark=spark,
+        collection_instance_id="2027-CAS-001",
+        source_table="socpophousdata1_dev.social_census_parsed.individual",
+        target_table="socpophousdata1_dev.social_census_validated.individual",
+    ) as logger:
+        logger.log(
+            rule="invalid_date_format",
+            event_type="DATACONTRACTVALIDATION",
+            variable_name="date_of_birth",
+            expected="yyyy-mm-dd",
+            observed="32/13/2023",
+            response_id="P123456789",
+        )
+
+Typical use — EventLogger (informational events):
+
+    from utils.logger import EventLogger
+
+    with EventLogger.for_task(
+        spark=spark,
+        collection_instance_id="2027-CAS-001",
+        source_table="socpophousdata1_dev.social_census_parsed.individual",
+        target_table="socpophousdata1_dev.social_census_classified.individual",
+    ) as logger:
+        logger.log(
+            event_type="coding",
+            message="Applied ethnic group coding rules successfully",
+            rule_name="ethnic_group_coding_v1",
+            response_id="P12345",
+            variable_name="ethnic_group",
+        )
+"""
+
+from utils.logger.base_logger import TableContractError
+from utils.logger.context import RunContext, build_run_context
+from utils.logger.event_logger import EventLogger
+from utils.logger.exception_logger import ExceptionLogger
+from utils.logger.registry import (
+    RegistryLoadError,
+    load_registry,
+)
+from utils.logger.schema import Severity, ValidationLevel
+from utils.logger.violation import Violation
+
+__all__ = [
+    "ExceptionLogger",
+    "EventLogger",
+    "Violation",
+    "RunContext",
+    "build_run_context",
+    "ValidationLevel",
+    "Severity",
+    "load_registry",
+    "RegistryLoadError",
+    "TableContractError",
+]
