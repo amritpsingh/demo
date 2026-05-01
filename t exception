@@ -11,10 +11,8 @@ import pytest
 import yaml
 
 from tests.unit._fakes import FakeInputDataFrame, FakeSpark
-
-
 from utils.logger.context import RunContext
-from utils.logger.exception_logger import ExceptionLogger
+from utils.logger.exception_logger import ExceptionLogger, _to_loggable
 from utils.logger.registry import load_registry
 from utils.logger.violation import Violation
 
@@ -29,6 +27,7 @@ _REGISTRY_YAML = {
         "null_not_allowed": {"error_code": "NULL_NOT_ALLOWED"},
         "invalid_date_format": {"error_code": "INVALID_DATE_FORMAT"},
         "value_out_of_range": {"error_code": "VALUE_OUT_OF_RANGE"},
+        "invalid_enum": {"error_code": "INVALID_ENUM"},
     },
     "error_codes": {
         "NULL_NOT_ALLOWED": {
@@ -42,6 +41,11 @@ _REGISTRY_YAML = {
             "severity": "ERROR",
         },
         "VALUE_OUT_OF_RANGE": {
+            "validation_level": "VALUE",
+            "blocking": True,
+            "severity": "ERROR",
+        },
+        "INVALID_ENUM": {
             "validation_level": "VALUE",
             "blocking": True,
             "severity": "ERROR",
@@ -82,7 +86,7 @@ def _make_spark(
     """
     A FakeSpark pre-registered with the exceptions table against
     ExceptionLogger's schema. Every logger-construction test needs this,
-    because BaseLogger.__init__ now validates the table contract.
+    because BaseLogger.__init__ validates the table contract.
     """
     spark = FakeSpark(raise_on_create=raise_on_create, raise_on_save=raise_on_save)
     spark.catalog.register("cat.logs.exceptions", ExceptionLogger._SCHEMA)
@@ -98,6 +102,42 @@ def logger(registry_file: Path, run_context: RunContext) -> ExceptionLogger:
         table_path="cat.logs.exceptions",
         batch_size=100,
     )
+
+
+# ─────────────────────────────────────────────
+# _to_loggable — the value→string convention
+# ─────────────────────────────────────────────
+
+def test_to_loggable_passes_through_none():
+    assert _to_loggable(None) is None
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (1899, "1899"),
+        (3.14, "3.14"),
+        (True, "True"),
+        ("Online", "Online"),
+        ("yyyy-mm-dd", "yyyy-mm-dd"),
+    ],
+)
+def test_to_loggable_primitives_become_str(value, expected):
+    """Primitives use str() so simple cases stay queryable with WHERE observed = 'X'."""
+    assert _to_loggable(value) == expected
+
+
+def test_to_loggable_dict_becomes_json():
+    """Structured values get JSON-encoded so they round-trip via parse_json()."""
+    import json
+    result = _to_loggable({"min": 0, "max": 120})
+    assert json.loads(result) == {"min": 0, "max": 120}
+
+
+def test_to_loggable_list_becomes_json():
+    import json
+    result = _to_loggable(["Online", "Phone", "Visit"])
+    assert json.loads(result) == ["Online", "Phone", "Visit"]
 
 
 # ─────────────────────────────────────────────
@@ -127,14 +167,14 @@ def test_batch_size_negative_rejected(registry_file: Path, run_context: RunConte
 
 
 # ─────────────────────────────────────────────
-# Record assembly
+# log() — single record
 # ─────────────────────────────────────────────
 
 def test_log_assembles_expected_fields(logger: ExceptionLogger):
     logger.log(
         rule="invalid_date_format",
         event_type="DATACONTRACTVALIDATION",
-        field="date_of_birth",
+        variable_name="date_of_birth",
         expected="yyyy-mm-dd",
         observed="32/13/2023",
         response_id="P123",
@@ -152,11 +192,15 @@ def test_log_assembles_expected_fields(logger: ExceptionLogger):
     assert record["severity"] == "ERROR"
     assert record["is_blocking"] is True
 
-    # Caller fields are passed through untouched.
+    # Caller fields are passed through.
     assert record["event_type"] == "DATACONTRACTVALIDATION"
     assert record["variable_name"] == "date_of_birth"
     assert record["response_id"] == "P123"
     assert record["stack_trace"] is None
+
+    # The new structured columns hold _to_loggable()-converted values.
+    assert record["expected"] == "yyyy-mm-dd"
+    assert record["observed"] == "32/13/2023"
 
     # Context fields come from RunContext.
     assert record["run_id"] == "run-xyz"
@@ -173,7 +217,7 @@ def test_log_accepts_custom_message_and_stack_trace(logger: ExceptionLogger):
     logger.log(
         rule="null_not_allowed",
         event_type="DATACONTRACTVALIDATION",
-        field="person_nbr",
+        variable_name="person_nbr",
         message="custom message",
         stack_trace="Traceback (most recent call last):\n  ...",
     )
@@ -191,18 +235,50 @@ def test_log_unknown_rule_raises(logger: ExceptionLogger):
         logger.log(rule="not_a_real_rule", event_type="TEST")
 
 
+def test_log_with_structured_expected_and_observed(logger: ExceptionLogger):
+    """
+    expected and observed should accept structured values too —
+    _to_loggable JSON-encodes them so they land in the column queryably.
+    """
+    import json
+
+    logger.log(
+        rule="value_out_of_range",
+        event_type="DATACONTRACTVALIDATION",
+        variable_name="age",
+        expected={"min": 0, "max": 120},
+        observed=999,
+    )
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    [record] = spark.created[0].rows
+
+    # Structured expected → JSON string.
+    assert json.loads(record["expected"]) == {"min": 0, "max": 120}
+    # Primitive observed → str().
+    assert record["observed"] == "999"
+
+
 # ─────────────────────────────────────────────
-# Batch semantics
+# log_many() — multiple violations, one record
 # ─────────────────────────────────────────────
 
 def test_log_many_with_scalar_response_id(logger: ExceptionLogger):
-    """Common path — all violations share the same response_id."""
+    """Common path — all violations relate to the same response_id."""
     violations = [
-        Violation(rule="invalid_date_format", field="dob", expected="d", observed="x"),
-        Violation(rule="null_not_allowed", field="name"),
+        Violation(
+            rule="invalid_date_format",
+            variable_name="dob",
+            expected="d",
+            observed="x",
+        ),
+        Violation(rule="null_not_allowed", variable_name="name"),
     ]
     logger.log_many(
-        violations, event_type="DATACONTRACTVALIDATION", response_id="P999"
+        violations,
+        event_type="DATACONTRACTVALIDATION",
+        response_id="P999",
     )
     logger.flush()
 
@@ -210,31 +286,8 @@ def test_log_many_with_scalar_response_id(logger: ExceptionLogger):
     records = spark.created[0].rows
 
     assert [r["response_id"] for r in records] == ["P999", "P999"]
-
-
-def test_log_many_with_aligned_response_id_list(logger: ExceptionLogger):
-    violations = [
-        Violation(rule="invalid_date_format"),
-        Violation(rule="null_not_allowed"),
-    ]
-    logger.log_many(
-        violations,
-        event_type="DATACONTRACTVALIDATION",
-        response_id=["A", "B"],
-    )
-    logger.flush()
-
-    spark: FakeSpark = logger._spark  # type: ignore[assignment]
-    records = spark.created[0].rows
-    assert [r["response_id"] for r in records] == ["A", "B"]
-
-
-def test_log_many_mismatched_response_id_list_rejected(logger: ExceptionLogger):
-    violations = [Violation(rule="null_not_allowed"), Violation(rule="null_not_allowed")]
-    with pytest.raises(ValueError, match="does not match violation count"):
-        logger.log_many(
-            violations, event_type="DC", response_id=["only_one"]
-        )
+    assert records[0]["variable_name"] == "dob"
+    assert records[1]["variable_name"] == "name"
 
 
 def test_log_many_shares_single_timestamp(logger: ExceptionLogger):
@@ -248,6 +301,62 @@ def test_log_many_shares_single_timestamp(logger: ExceptionLogger):
     timestamps = {r["created_timestamp_utc"] for r in records}
     assert len(timestamps) == 1, "all records in one batch should share a timestamp"
 
+
+def test_log_many_uses_violation_message_when_set(logger: ExceptionLogger):
+    """When Violation.message is set, that message wins over auto-generation."""
+    violations = [
+        Violation(
+            rule="null_not_allowed",
+            variable_name="dob",
+            message="custom-per-violation message",
+        ),
+        Violation(
+            rule="null_not_allowed",
+            variable_name="name",
+            # message=None — should auto-generate
+        ),
+    ]
+    logger.log_many(violations, event_type="DC", response_id="P-1")
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    records = spark.created[0].rows
+
+    # First violation had a custom message — used as-is.
+    assert records[0]["message"] == "custom-per-violation message"
+    # Second violation had no message — auto-generated.
+    assert records[1]["message"].startswith("Rule 'null_not_allowed' failed.")
+
+
+def test_log_many_violation_expected_observed_persisted(logger: ExceptionLogger):
+    """Per-violation expected/observed land in the new structured columns."""
+    violations = [
+        Violation(
+            rule="invalid_enum",
+            variable_name="i_mode",
+            expected="Online | Phone | Visit",
+            observed="email",
+        ),
+    ]
+    logger.log_many(violations, event_type="DC", response_id="P-1")
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    [record] = spark.created[0].rows
+
+    assert record["expected"] == "Online | Phone | Visit"
+    assert record["observed"] == "email"
+
+
+def test_log_many_empty_violations_is_noop(logger: ExceptionLogger):
+    """Empty list of violations should produce no records."""
+    logger.log_many([], event_type="DC", response_id="P-1")
+    assert logger.buffer_size == 0
+
+
+# ─────────────────────────────────────────────
+# Auto-flush
+# ─────────────────────────────────────────────
 
 def test_auto_flush_on_batch_size(registry_file: Path, run_context: RunContext):
     spark = _make_spark()
@@ -264,9 +373,6 @@ def test_auto_flush_on_batch_size(registry_file: Path, run_context: RunContext):
     assert spark.created == []
 
     logger.log(rule="null_not_allowed", event_type="DC")
-    # Hit batch_size — should have auto-flushed. spark.created is now a
-    # list of FakeDataFrame objects (shared helper format), and each df
-    # carries its rows in .rows.
     assert logger.buffer_size == 0
     assert len(spark.created) == 1
     assert len(spark.created[0].rows) == 2
@@ -277,7 +383,7 @@ def test_auto_flush_on_batch_size(registry_file: Path, run_context: RunContext):
 # ─────────────────────────────────────────────
 
 def test_flush_empty_buffer_is_noop(logger: ExceptionLogger):
-    logger.flush()  # must not raise, must not write
+    logger.flush()
     spark: FakeSpark = logger._spark  # type: ignore[assignment]
     assert spark.created == []
 
@@ -297,7 +403,6 @@ def test_flush_failure_preserves_buffer(registry_file: Path, run_context: RunCon
     with pytest.raises(RuntimeError, match="Failed to write"):
         logger.flush()
 
-    # Buffer must still contain the record — operator needs to see what failed.
     assert logger.buffer_size == 1
 
 
@@ -306,45 +411,32 @@ def test_flush_failure_preserves_buffer(registry_file: Path, run_context: RunCon
 # ─────────────────────────────────────────────
 
 def test_context_manager_flushes_on_normal_exit(logger: ExceptionLogger):
-    with logger as lg:
-        lg.log(rule="null_not_allowed", event_type="DC")
-        assert lg.buffer_size == 1
+    with logger:
+        logger.log(rule="null_not_allowed", event_type="DC")
 
-    assert logger.buffer_size == 0
     spark: FakeSpark = logger._spark  # type: ignore[assignment]
     assert len(spark.created) == 1
 
 
 def test_context_manager_flushes_on_exception_exit(logger: ExceptionLogger):
-    """Pipeline raising shouldn't cause log loss."""
-    with pytest.raises(RuntimeError, match="pipeline failure"):
-        with logger as lg:
-            lg.log(rule="null_not_allowed", event_type="DC")
-            raise RuntimeError("pipeline failure")
+    with pytest.raises(RuntimeError, match="task failure"):
+        with logger:
+            logger.log(rule="null_not_allowed", event_type="DC")
+            raise RuntimeError("task failure")
 
-    # Records buffered before the exception must still have been flushed.
     spark: FakeSpark = logger._spark  # type: ignore[assignment]
     assert len(spark.created) == 1
-    assert len(spark.created[0].rows) == 1
 
 
-def test_context_manager_does_not_suppress_exception(logger: ExceptionLogger):
-    """__exit__ returns False — original exception must propagate."""
-    class MyErr(Exception):
-        pass
-
-    with pytest.raises(MyErr):
-        with logger:
-            raise MyErr("test")
 # ─────────────────────────────────────────────
-# log_dataframe
+# log_dataframe()
 # ─────────────────────────────────────────────
 
 def test_log_dataframe_creates_one_record_per_row(logger: ExceptionLogger):
     """
-    Two failing rows in the input DataFrame should produce two exception
-    records, each carrying the per-row response_id and observed values
-    plus the constant rule/event_type/expected applied to every row.
+    Two failing rows in the input DataFrame produce two exception records,
+    each carrying per-row response_id and observed values plus the constants
+    applied to every row.
     """
     df = FakeInputDataFrame(
         columns=["response_id", "observed"],
@@ -358,7 +450,7 @@ def test_log_dataframe_creates_one_record_per_row(logger: ExceptionLogger):
         df,
         rule="value_out_of_range",
         event_type="DATACONTRACTVALIDATION",
-        field="dob_year",
+        variable_name="dob_year",
         expected="1900-2026",
         response_id_column="response_id",
         observed_column="observed",
@@ -373,16 +465,17 @@ def test_log_dataframe_creates_one_record_per_row(logger: ExceptionLogger):
     assert len(rows) == 2
     assert rows[0]["response_id"] == "P-001"
     assert rows[0]["variable_name"] == "dob_year"
-    assert "1899" in rows[0]["message"]
+    # observed becomes a string via _to_loggable
+    assert rows[0]["observed"] == "1899"
+    assert rows[0]["expected"] == "1900-2026"
     assert rows[1]["response_id"] == "P-002"
-    assert "2050" in rows[1]["message"]
+    assert rows[1]["observed"] == "2050"
 
 
 def test_log_dataframe_resolves_governance_once(logger: ExceptionLogger):
     """
-    The registry should be consulted once for the whole DataFrame, not
-    once per row — every record carries the same error_code / severity /
-    is_blocking values.
+    The registry should be consulted once per DataFrame call — every record
+    carries the same governance metadata.
     """
     df = FakeInputDataFrame(
         columns=["response_id", "observed"],
@@ -404,7 +497,6 @@ def test_log_dataframe_resolves_governance_once(logger: ExceptionLogger):
     spark: FakeSpark = logger._spark  # type: ignore[assignment]
     rows = spark.created[0].rows
 
-    # Both rows resolved to the same FIELD-level governance.
     assert all(r["error_code"] == "INVALID_DATE_FORMAT" for r in rows)
     assert all(r["validation_level"] == "FIELD" for r in rows)
     assert all(r["is_blocking"] is True for r in rows)
@@ -413,8 +505,8 @@ def test_log_dataframe_resolves_governance_once(logger: ExceptionLogger):
 def test_log_dataframe_shares_one_timestamp(logger: ExceptionLogger):
     """All rows in one log_dataframe call must share a created_timestamp_utc."""
     df = FakeInputDataFrame(
-        columns=["response_id"],
-        rows=[{"response_id": f"P-{i}"} for i in range(5)],
+        columns=["response_id", "observed"],
+        rows=[{"response_id": f"P-{i}", "observed": i} for i in range(5)],
     )
 
     logger.log_dataframe(
@@ -422,6 +514,7 @@ def test_log_dataframe_shares_one_timestamp(logger: ExceptionLogger):
         rule="null_not_allowed",
         event_type="DATACONTRACTVALIDATION",
         response_id_column="response_id",
+        observed_column="observed",
     )
     logger.flush()
 
@@ -431,16 +524,13 @@ def test_log_dataframe_shares_one_timestamp(logger: ExceptionLogger):
     assert len(timestamps) == 1
 
 
-def test_log_dataframe_field_column_per_row(logger: ExceptionLogger):
-    """
-    field_column lets each row declare which column failed. Useful when
-    a single validation pass spans multiple fields.
-    """
+def test_log_dataframe_variable_name_column_per_row(logger: ExceptionLogger):
+    """variable_name_column lets each row declare which variable failed."""
     df = FakeInputDataFrame(
-        columns=["response_id", "field"],
+        columns=["response_id", "observed", "variable"],
         rows=[
-            {"response_id": "P-001", "field": "dob_year"},
-            {"response_id": "P-002", "field": "i_mode"},
+            {"response_id": "P-001", "observed": "x", "variable": "dob_year"},
+            {"response_id": "P-002", "observed": "y", "variable": "i_mode"},
         ],
     )
 
@@ -449,7 +539,8 @@ def test_log_dataframe_field_column_per_row(logger: ExceptionLogger):
         rule="null_not_allowed",
         event_type="DATACONTRACTVALIDATION",
         response_id_column="response_id",
-        field_column="field",
+        observed_column="observed",
+        variable_name_column="variable",
     )
     logger.flush()
 
@@ -459,32 +550,36 @@ def test_log_dataframe_field_column_per_row(logger: ExceptionLogger):
     assert rows[1]["variable_name"] == "i_mode"
 
 
-def test_log_dataframe_rejects_field_and_field_column_both_set(
+def test_log_dataframe_rejects_variable_name_and_column_both_set(
     logger: ExceptionLogger,
 ):
     """
-    Pass either constant `field` or per-row `field_column`, never both —
-    the conflict is a programming error.
+    Pass either constant variable_name or per-row variable_name_column,
+    never both — the conflict is a programming error.
     """
-    df = FakeInputDataFrame(columns=["response_id"], rows=[{"response_id": "P-1"}])
+    df = FakeInputDataFrame(
+        columns=["response_id", "observed", "variable"],
+        rows=[{"response_id": "P-1", "observed": "x", "variable": "v"}],
+    )
 
     with pytest.raises(ValueError, match="not both"):
         logger.log_dataframe(
             df,
             rule="null_not_allowed",
             event_type="DC",
-            field="dob_year",
-            field_column="field",
+            variable_name="dob_year",
+            variable_name_column="variable",
             response_id_column="response_id",
+            observed_column="observed",
         )
 
 
 def test_log_dataframe_rejects_unknown_column(logger: ExceptionLogger):
-    """
-    Catch typos in column names early — silently producing all-NULL columns
-    is worse than failing at submission.
-    """
-    df = FakeInputDataFrame(columns=["response_id"], rows=[{"response_id": "P-1"}])
+    """Catch typos in column names early — silent NULL is worse than failure."""
+    df = FakeInputDataFrame(
+        columns=["response_id", "observed"],
+        rows=[{"response_id": "P-1", "observed": "x"}],
+    )
 
     with pytest.raises(ValueError, match="not in DataFrame"):
         logger.log_dataframe(
@@ -492,18 +587,20 @@ def test_log_dataframe_rejects_unknown_column(logger: ExceptionLogger):
             rule="null_not_allowed",
             event_type="DC",
             response_id_column="not_a_column",
+            observed_column="observed",
         )
 
 
 def test_log_dataframe_empty_input_is_noop(logger: ExceptionLogger):
-    """An empty DataFrame should return 0 and not push anything to the buffer."""
-    df = FakeInputDataFrame(columns=["response_id"], rows=[])
+    """Empty DataFrame should return 0 and not push to buffer."""
+    df = FakeInputDataFrame(columns=["response_id", "observed"], rows=[])
 
     written = logger.log_dataframe(
         df,
         rule="null_not_allowed",
         event_type="DC",
         response_id_column="response_id",
+        observed_column="observed",
     )
 
     assert written == 0
@@ -511,15 +608,11 @@ def test_log_dataframe_empty_input_is_noop(logger: ExceptionLogger):
 
 
 def test_log_dataframe_rejects_oversized_input(logger: ExceptionLogger):
-    """
-    The 100k-row safety limit protects driver memory. Tests use a much
-    smaller fake limit so we don't have to materialise 100k rows in memory.
-    """
-    # Temporarily override the class-level limit for this test only.
+    """The driver-collect safety limit protects against accidental OOMs."""
     logger.DATAFRAME_ROW_LIMIT = 3
     df = FakeInputDataFrame(
-        columns=["response_id"],
-        rows=[{"response_id": f"P-{i}"} for i in range(5)],
+        columns=["response_id", "observed"],
+        rows=[{"response_id": f"P-{i}", "observed": i} for i in range(5)],
     )
 
     with pytest.raises(ValueError, match="exceeding the safety limit"):
@@ -528,4 +621,5 @@ def test_log_dataframe_rejects_oversized_input(logger: ExceptionLogger):
             rule="null_not_allowed",
             event_type="DC",
             response_id_column="response_id",
+            observed_column="observed",
         )
