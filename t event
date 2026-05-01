@@ -5,9 +5,9 @@ Uses shared test doubles from tests.unit._fakes so the fake Spark surface
 stays in one place across all logger test files.
 
 Focuses on EventLogger-specific behaviour — record assembly, optional
-fields, auto-generated IDs and timestamps. Buffer, flush, and context-
-manager semantics are inherited from BaseLogger and covered exhaustively
-in tests/unit/test_base_logger.py, so we don't duplicate those here.
+fields, message/variable_name shapes. Buffer, flush, and context-manager
+semantics are inherited from BaseLogger and covered exhaustively in
+tests/unit/test_base_logger.py, so we don't duplicate those here.
 """
 
 from datetime import datetime, timezone
@@ -74,11 +74,8 @@ def test_batch_size_zero_rejected(run_context: RunContext):
 
 
 def test_missing_table_rejected(run_context: RunContext):
-    """
-    Construction fails if the target events table doesn't exist.
-    The table must be pre-created by a migration.
-    """
-    spark = FakeSpark()  # no catalog registration — table appears missing
+    """Construction fails if the target events table doesn't exist."""
+    spark = FakeSpark()  # no catalog registration
     from utils.logger import TableContractError
 
     with pytest.raises(TableContractError, match="does not exist"):
@@ -91,16 +88,16 @@ def test_missing_table_rejected(run_context: RunContext):
 
 
 # ─────────────────────────────────────────────
-# Record assembly
+# log() — single record
 # ─────────────────────────────────────────────
 
-def test_log_event_assembles_expected_fields(logger: EventLogger):
+def test_log_assembles_expected_fields(logger: EventLogger):
     """
-    A fully-specified log_event call should produce a record with every
+    A fully-specified log() call should produce a record with every
     caller-supplied field passed through, context fields stamped in, and
-    auto-generated fields (observation_id, timestamp) populated.
+    framework-managed fields (observation_id, timestamp) populated.
     """
-    logger.log_event(
+    logger.log(
         event_type="coding",
         message="Applied ethnic group coding rules successfully",
         rule_name="ethnic_group_coding_v1",
@@ -128,18 +125,14 @@ def test_log_event_assembles_expected_fields(logger: EventLogger):
     assert record["target_table"] == "cat.schema.tgt"
     assert record["collection_instance_id"] == "2027-TEST-001"
 
-    # Auto-generated fields are present and the right shape.
+    # Framework-managed fields populated automatically.
     assert record["observation_id"] is not None
     assert isinstance(record["created_timestamp_utc"], datetime)
 
 
-def test_log_event_optional_fields_default_to_none(logger: EventLogger):
-    """
-    rule_name / response_id / variable_name are all optional. When the
-    caller omits them, they should land in the record as None (not missing
-    keys — the schema requires the column to exist, just not non-null).
-    """
-    logger.log_event(event_type="validation", message="passed")
+def test_log_optional_fields_default_to_none(logger: EventLogger):
+    """rule_name / response_id / variable_name are all optional."""
+    logger.log(event_type="validation", message="passed")
     logger.flush()
 
     spark: FakeSpark = logger._spark  # type: ignore[assignment]
@@ -150,81 +143,63 @@ def test_log_event_optional_fields_default_to_none(logger: EventLogger):
     assert record["variable_name"] is None
 
 
-def test_log_event_auto_generates_observation_id(logger: EventLogger):
-    """observation_id should be generated when the caller doesn't supply one."""
-    logger.log_event(event_type="coding", message="test")
+def test_log_auto_generates_uuid_observation_id(logger: EventLogger):
+    """observation_id is framework-managed — auto-generated UUID."""
+    logger.log(event_type="coding", message="test")
     logger.flush()
 
     spark: FakeSpark = logger._spark  # type: ignore[assignment]
     [record] = spark.created[0].rows
 
-    # Sanity-check — observation_id is present, is a string, and looks UUID-ish.
     import uuid as uuid_mod
     uuid_mod.UUID(record["observation_id"])  # raises if not a valid UUID
 
 
-def test_log_event_caller_can_override_observation_id(logger: EventLogger):
-    """
-    Sometimes the caller wants to correlate the event record with an
-    external ID. When they pass observation_id explicitly, it must be used.
-    """
-    logger.log_event(
-        event_type="coding",
-        message="test",
-        observation_id="external-id-xyz",
-    )
-    logger.flush()
-
-    spark: FakeSpark = logger._spark  # type: ignore[assignment]
-    [record] = spark.created[0].rows
-
-    assert record["observation_id"] == "external-id-xyz"
-
-
-def test_log_event_auto_generates_timestamp(logger: EventLogger):
-    """Timestamp defaults to datetime.now(timezone.utc) when not supplied."""
+def test_log_auto_generates_utc_timestamp(logger: EventLogger):
+    """Timestamp is framework-managed — datetime.now(timezone.utc)."""
     before = datetime.now(timezone.utc)
-    logger.log_event(event_type="coding", message="test")
+    logger.log(event_type="coding", message="test")
     after = datetime.now(timezone.utc)
     logger.flush()
 
     spark: FakeSpark = logger._spark  # type: ignore[assignment]
     [record] = spark.created[0].rows
 
-    # The generated timestamp should sit between the two clock reads.
     assert before <= record["created_timestamp_utc"] <= after
     assert record["created_timestamp_utc"].tzinfo == timezone.utc
 
 
-def test_log_event_caller_can_override_timestamp(logger: EventLogger):
+def test_log_does_not_accept_observation_id_override(logger: EventLogger):
     """
-    Useful when backfilling historical events — the event happened at a
-    specific time in the past, and we want that recorded rather than "now".
+    observation_id used to be overridable but the consolidation removed
+    that — the framework owns this field.
     """
-    past_time = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
-    logger.log_event(
-        event_type="coding",
-        message="backfill",
-        created_timestamp_utc=past_time,
-    )
-    logger.flush()
+    with pytest.raises(TypeError, match="observation_id"):
+        logger.log(  # type: ignore[call-arg]
+            event_type="coding",
+            message="test",
+            observation_id="external-id",
+        )
 
-    spark: FakeSpark = logger._spark  # type: ignore[assignment]
-    [record] = spark.created[0].rows
 
-    assert record["created_timestamp_utc"] == past_time
+def test_log_does_not_accept_timestamp_override(logger: EventLogger):
+    """
+    created_timestamp_utc used to be overridable but the consolidation
+    removed that — the framework owns this field.
+    """
+    with pytest.raises(TypeError, match="created_timestamp_utc"):
+        logger.log(  # type: ignore[call-arg]
+            event_type="coding",
+            message="test",
+            created_timestamp_utc=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        )
 
 
 # ─────────────────────────────────────────────
-# Batch semantics
+# Auto-flush
 # ─────────────────────────────────────────────
 
 def test_auto_flush_on_batch_size(run_context: RunContext):
-    """
-    When the buffer reaches batch_size, the logger auto-flushes. This is
-    inherited from BaseLogger, but worth confirming the hook is wired up
-    correctly for EventLogger too.
-    """
     spark = _make_spark()
     logger = EventLogger(
         spark=spark,  # type: ignore[arg-type]
@@ -233,13 +208,12 @@ def test_auto_flush_on_batch_size(run_context: RunContext):
         batch_size=2,
     )
 
-    logger.log_event(event_type="coding", message="event 1")
+    logger.log(event_type="coding", message="event 1")
     assert logger.buffer_size == 1
     assert spark.created == []
 
-    logger.log_event(event_type="coding", message="event 2")
+    logger.log(event_type="coding", message="event 2")
 
-    # Hit batch_size — auto-flushed.
     assert logger.buffer_size == 0
     assert len(spark.created) == 1
     assert len(spark.created[0].rows) == 2
@@ -250,11 +224,6 @@ def test_auto_flush_on_batch_size(run_context: RunContext):
 # ─────────────────────────────────────────────
 
 def test_context_manager_flushes_on_clean_exit(run_context: RunContext):
-    """
-    End-to-end smoke test: using EventLogger as a context manager should
-    auto-flush on exit. Full context-manager semantics (exceptions, flush
-    failures, caller-exception priority) are covered in test_base_logger.py.
-    """
     spark = _make_spark()
 
     with EventLogger(
@@ -263,12 +232,10 @@ def test_context_manager_flushes_on_clean_exit(run_context: RunContext):
         table_path="cat.logs.events",
         batch_size=100,
     ) as logger:
-        logger.log_event(event_type="coding", message="test")
+        logger.log(event_type="coding", message="test")
         assert logger.buffer_size == 1
 
-    # Exiting the with block triggered flush.
     assert len(spark.created) == 1
-    assert len(spark.created[0].rows) == 1
 
 
 # ─────────────────────────────────────────────
@@ -277,9 +244,9 @@ def test_context_manager_flushes_on_clean_exit(run_context: RunContext):
 
 def test_for_task_builds_logger_with_resolved_defaults(run_context: RunContext):
     """
-    for_task should collapse the multi-step setup into one call. We need
-    to patch build_run_context so it returns our test RunContext (the
-    real one tries to read Databricks state).
+    for_task should collapse multi-step setup into one call. We patch
+    build_run_context so it returns our test RunContext (the real one
+    tries to read Databricks state).
     """
     from unittest.mock import patch
 
@@ -292,18 +259,17 @@ def test_for_task_builds_logger_with_resolved_defaults(run_context: RunContext):
         logger = EventLogger.for_task(
             spark=spark,  # type: ignore[arg-type]
             collection_instance_id="2027-TEST-001",
-            log_table_path="cat.logs.events",  # override the default table path
+            log_table_path="cat.logs.events",
         )
 
-    # The logger is fully functional — it can accept and flush events.
-    logger.log_event(event_type="coding", message="test")
+    logger.log(event_type="coding", message="test")
     logger.flush()
 
     assert len(spark.created) == 1
 
 
 # ─────────────────────────────────────────────
-# log_dataframe
+# log_dataframe()
 # ─────────────────────────────────────────────
 
 def test_log_dataframe_creates_one_record_per_row(logger: EventLogger):
@@ -342,9 +308,7 @@ def test_log_dataframe_creates_one_record_per_row(logger: EventLogger):
 
 
 def test_log_dataframe_with_constant_message(logger: EventLogger):
-    """
-    Constant `message` applied to every row — no message_column needed.
-    """
+    """Constant `message` applied to every row — no message_column."""
     df = FakeInputDataFrame(
         columns=["response_id"],
         rows=[{"response_id": f"P-{i}"} for i in range(3)],
@@ -363,9 +327,57 @@ def test_log_dataframe_with_constant_message(logger: EventLogger):
     assert all(r["message"] == "Coded successfully" for r in rows)
 
 
+def test_log_dataframe_with_constant_variable_name(logger: EventLogger):
+    """variable_name as a constant applies to every row."""
+    df = FakeInputDataFrame(
+        columns=["response_id"],
+        rows=[{"response_id": f"P-{i}"} for i in range(3)],
+    )
+
+    logger.log_dataframe(
+        df,
+        event_type="coding",
+        message="processed",
+        variable_name="ethnic_group",
+        response_id_column="response_id",
+    )
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    rows = spark.created[0].rows
+    assert all(r["variable_name"] == "ethnic_group" for r in rows)
+
+
+def test_log_dataframe_with_variable_name_column(logger: EventLogger):
+    """variable_name_column lets each row declare its variable independently."""
+    df = FakeInputDataFrame(
+        columns=["response_id", "variable"],
+        rows=[
+            {"response_id": "P-001", "variable": "ethnic_group"},
+            {"response_id": "P-002", "variable": "religion"},
+        ],
+    )
+
+    logger.log_dataframe(
+        df,
+        event_type="coding",
+        message="processed",
+        variable_name_column="variable",
+        response_id_column="response_id",
+    )
+    logger.flush()
+
+    spark: FakeSpark = logger._spark  # type: ignore[assignment]
+    rows = spark.created[0].rows
+    assert rows[0]["variable_name"] == "ethnic_group"
+    assert rows[1]["variable_name"] == "religion"
+
+
 def test_log_dataframe_requires_message_or_message_column(logger: EventLogger):
     """Every event needs a message — neither supplied is a programming error."""
-    df = FakeInputDataFrame(columns=["response_id"], rows=[{"response_id": "P-1"}])
+    df = FakeInputDataFrame(
+        columns=["response_id"], rows=[{"response_id": "P-1"}]
+    )
 
     with pytest.raises(ValueError, match="every event needs a message"):
         logger.log_dataframe(
@@ -390,6 +402,26 @@ def test_log_dataframe_rejects_message_and_message_column_both_set(
             event_type="coding",
             message="constant",
             message_column="msg",
+            response_id_column="response_id",
+        )
+
+
+def test_log_dataframe_rejects_variable_name_and_column_both_set(
+    logger: EventLogger,
+):
+    """Both supplied for variable_name is also ambiguous — pick one."""
+    df = FakeInputDataFrame(
+        columns=["response_id", "variable"],
+        rows=[{"response_id": "P-1", "variable": "v"}],
+    )
+
+    with pytest.raises(ValueError, match="not both"):
+        logger.log_dataframe(
+            df,
+            event_type="coding",
+            message="m",
+            variable_name="ethnic_group",
+            variable_name_column="variable",
             response_id_column="response_id",
         )
 
