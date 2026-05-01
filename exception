@@ -6,7 +6,7 @@ Inherits from BaseLogger for buffering, flushing, context-manager lifecycle,
 and table-contract validation. Adds the exception-specific surface:
     * The exceptions Delta schema.
     * Registry lookup to resolve rule names → governance metadata.
-    * ``log()`` and ``log_many()`` public APIs.
+    * ``log()``, ``log_many()``, and ``log_dataframe()`` public APIs.
     * The ``for_task()`` factory that wires everything together in one call.
 
 Caller-facing surface (intentionally tiny):
@@ -22,23 +22,21 @@ Caller-facing surface (intentionally tiny):
         logger.log(
             rule="invalid_date_format",
             event_type="DATACONTRACTVALIDATION",
-            field="date_of_birth",
+            variable_name="date_of_birth",
             expected="yyyy-mm-dd",
             observed="32/13/2023",
             response_id="P123456789",
         )
-
-The context manager flushes on exit (including when the block exits via
-an exception), so buffered records are never lost silently.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Union
+from typing import Any, Iterable, Optional, Union
 
 from pyspark.sql import SparkSession
 from pyspark.sql.types import (
@@ -59,14 +57,33 @@ from utils.logger.registry import (
 from utils.logger.violation import Violation
 
 
-# Default exceptions Delta table. Override per-task via the ``log_table_path``
-# argument to for_task(), or globally via the environment variable below.
-# TODO: resolve through CollectionConfig.get_table_path() once the logs
-# steady_state is registered there.
 _LOG_TABLE_ENV_VAR = "CENSUS_EXCEPTION_LOG_TABLE"
 _DEFAULT_LOG_TABLE = "socpophousdata1_dev.social_census_logs.exceptions"
 
 _DEFAULT_BATCH_SIZE = 100
+
+
+def _to_loggable(value: Any) -> Optional[str]:
+    """
+    Convert any caller-supplied value to a string suitable for the
+    ``expected`` / ``observed`` columns.
+
+    Convention (until/unless we move to VARIANT):
+        * None        → None
+        * primitives  → str(value)        e.g. 1899 → "1899", True → "True"
+        * structures  → json.dumps(value) e.g. {"min": 0, "max": 120}
+
+    This keeps simple cases queryable with ``WHERE observed = '1899'`` and
+    structured cases queryable with ``WHERE parse_json(observed):min = 0``.
+    Operators can rely on the convention because every record produced by
+    every method goes through this function.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return str(value)
+    # Lists, dicts, tuples, etc. — JSON-encode so they round-trip cleanly.
+    return json.dumps(value, default=str)
 
 
 class ExceptionLogger(BaseLogger):
@@ -77,9 +94,6 @@ class ExceptionLogger(BaseLogger):
     :meth:`ExceptionLogger.for_task`.
     """
 
-    # The schema this logger writes. Exposed via the ``_schema`` property
-    # below (required by BaseLogger). Stored as a class attribute so every
-    # instance shares the same StructType object — it never varies per run.
     _SCHEMA: StructType = StructType([
         StructField("observation_id", StringType(), False),
         StructField("run_id", StringType(), False),
@@ -92,6 +106,8 @@ class ExceptionLogger(BaseLogger):
         StructField("error_code", StringType(), False),
         StructField("severity", StringType(), False),
         StructField("message", StringType(), True),
+        StructField("expected", StringType(), True),
+        StructField("observed", StringType(), True),
         StructField("response_id", StringType(), True),
         StructField("collection_instance_id", StringType(), True),
         StructField("variable_name", StringType(), True),
@@ -121,28 +137,13 @@ class ExceptionLogger(BaseLogger):
 
         Most callers should use :meth:`for_task` instead — it wires up the
         registry, context, and default table path automatically.
-
-        Args:
-            spark: Active SparkSession.
-            registry: The error code registry — used to resolve validation
-                rule names into error_code / validation_level / severity /
-                is_blocking.
-            context: RunContext — run_id, task_key, source_table, etc.
-            table_path: Fully-qualified exceptions Delta table.
-            batch_size: Records to buffer before auto-flush.
         """
-        # Delegate buffering, flushing, context-manager, and table-contract
-        # validation to the base. Schema validation happens here as part of
-        # super().__init__, because BaseLogger reads self._schema during
-        # validation and the subclass's _schema property is already bound.
         super().__init__(
             spark=spark,
             context=context,
             table_path=table_path,
             batch_size=batch_size,
         )
-
-        # Exception-specific state goes after the super() call.
         self._registry = registry
 
     # ────────────────────────────────────────────────────────
@@ -165,24 +166,8 @@ class ExceptionLogger(BaseLogger):
         """
         Build a fully-configured ExceptionLogger for a single task.
 
-        Collapses the old four-step setup (load registry → build context →
-        init logger → remember to flush) into one call. The resulting logger
+        Collapses the multi-step setup into one call. The resulting logger
         is a context manager — use it inside a ``with`` block.
-
-        Args:
-            spark: Active SparkSession.
-            collection_instance_id: Sub-operation the data relates to
-                (e.g. ``"2027-CAS-001"``).
-            task_key: Optional override for the task key. Defaults to the
-                Databricks Job task_key; falls back to "unknown" otherwise.
-            source_table: Fully-qualified upstream table, if any.
-            target_table: Fully-qualified downstream table, if any.
-            log_table_path: Override for the exceptions Delta table.
-                Falls back to ``$CENSUS_EXCEPTION_LOG_TABLE`` env var, then
-                to the project default.
-            registry_path: Override for the registry YAML. Defaults to the
-                YAML shipped with this module.
-            batch_size: Records to buffer before auto-flush.
         """
         registry = load_registry(registry_path)
 
@@ -216,7 +201,7 @@ class ExceptionLogger(BaseLogger):
         *,
         rule: str,
         event_type: str,
-        field: Optional[str] = None,
+        variable_name: Optional[str] = None,
         expected: Any = None,
         observed: Any = None,
         response_id: Optional[str] = None,
@@ -230,9 +215,12 @@ class ExceptionLogger(BaseLogger):
             rule: Validation rule key (must exist in the registry).
             event_type: Event category — e.g. ``"DATACONTRACTVALIDATION"``,
                 ``"coding"``, ``"MI_fix"``, ``"edit"``, ``"imputation"``.
-            field: Name of the offending field, if applicable.
-            expected: Expected value / pattern / range.
-            observed: Observed value.
+            variable_name: Name of the offending variable, if applicable.
+                None for FILE-level or RECORD-level failures.
+            expected: Expected value / pattern / range. Stored as a string
+                in the log table — primitives via ``str()``, structures via
+                ``json.dumps()``.
+            observed: Observed value, stored the same way as ``expected``.
             response_id: Primary key of the row, if applicable. ``None``
                 for FILE-level failures.
             message: Custom human-readable message. If omitted, a default
@@ -245,7 +233,7 @@ class ExceptionLogger(BaseLogger):
             resolved=resolved,
             event_type=event_type,
             rule=rule,
-            field=field,
+            variable_name=variable_name,
             expected=expected,
             observed=observed,
             response_id=response_id,
@@ -256,7 +244,7 @@ class ExceptionLogger(BaseLogger):
         self._add_to_buffer(record)
 
     # ────────────────────────────────────────────────────────
-    # Public API — bulk
+    # Public API — bulk for one logical record
     # ────────────────────────────────────────────────────────
 
     def log_many(
@@ -264,59 +252,48 @@ class ExceptionLogger(BaseLogger):
         violations: Iterable[Violation],
         *,
         event_type: str,
-        response_id: Optional[Union[str, List[str]]] = None,
+        response_id: Optional[str] = None,
         stack_trace: Optional[str] = None,
     ) -> None:
         """
-        Log many violations that share an event_type.
+        Log many violations that share a single response_id and event_type.
+
+        Use when one logical record fails multiple validation rules — e.g.
+        a record where ``person_nbr`` is null AND ``i_mode`` is invalid AND
+        ``i_submitted_date_time`` is malformed. All three failures share
+        the same ``response_id``.
+
+        For failures that span many response_ids, use :meth:`log_dataframe`
+        instead.
+
+        Each Violation may carry its own ``message``. When ``Violation.message``
+        is set, it is used as-is. When None, the logger generates a default
+        ``"Rule X failed. Expected=..., Observed=..."`` message.
 
         Args:
             violations: Iterable of Violation instances.
-            event_type: Event category shared by all violations in this batch.
-            response_id: Either a single response_id applied to every
-                violation (common case — all violations relate to the same
-                record, so dwell_nbr / person_nbr is repeated), or a list
-                aligned positionally with ``violations``. ``None`` is valid
-                for FILE-level batches.
-            stack_trace: Optional traceback, shared across all violations.
-
-        Raises:
-            ValueError: if ``response_id`` is a list whose length doesn't
-                match the number of violations.
+            event_type: Event category shared by all violations.
+            response_id: The response_id every violation relates to.
+                ``None`` is valid for FILE-level batches that don't have
+                a per-record identifier.
+            stack_trace: Optional traceback shared across all violations.
         """
         violations = list(violations)
 
-        # One timestamp per batch, not per record. All violations produced
-        # by a single validation pass should share the same timestamp so
-        # operators can filter "all exceptions from this pass" cleanly.
+        # One timestamp per batch — every violation in this call shares it.
         timestamp = datetime.now(timezone.utc)
 
-        # response_id can be a scalar (broadcast to every violation) or a
-        # list aligned positionally. The scalar case is the common one —
-        # most validation passes are scoped to a single record.
-        if isinstance(response_id, list):
-            if len(response_id) != len(violations):
-                raise ValueError(
-                    f"response_id list length ({len(response_id)}) does "
-                    f"not match violation count ({len(violations)})"
-                )
-            response_ids_aligned: List[Optional[str]] = list(response_id)
-        else:
-            response_ids_aligned = [response_id] * len(violations)
-
-        # strict=True raises if the two iterables are different lengths —
-        # defensive check against bugs in the broadcast logic above.
-        for violation, rid in zip(violations, response_ids_aligned, strict=True):
+        for violation in violations:
             resolved = self._registry.resolve(violation.rule)
             record = self._build_record(
                 resolved=resolved,
                 event_type=event_type,
                 rule=violation.rule,
-                field=violation.field,
+                variable_name=violation.variable_name,
                 expected=violation.expected,
                 observed=violation.observed,
-                response_id=rid,
-                message=None,
+                response_id=response_id,
+                message=violation.message,  # None ⇒ auto-generated in _build_record
                 stack_trace=stack_trace,
                 timestamp=timestamp,
             )
@@ -332,44 +309,54 @@ class ExceptionLogger(BaseLogger):
         *,
         rule: str,
         event_type: str,
-        field: Optional[str] = None,
+        variable_name: Optional[str] = None,
+        variable_name_column: Optional[str] = None,
         expected: Any = None,
-        response_id_column: Optional[str] = None,
-        observed_column: Optional[str] = None,
-        field_column: Optional[str] = None,
+        response_id_column: str,
+        observed_column: str,
         message: Optional[str] = None,
         stack_trace: Optional[str] = None,
     ) -> int:
         """
         Log every row of a DataFrame as a separate exception record.
 
-        Use when validation produced its results as a DataFrame (the
-        natural output of ``.filter(...)`` or expectation checks) and
+        Use when validation produced its results as a DataFrame — the
+        natural output of ``.filter(...)`` or expectation checks — and
         you'd otherwise have to write ``df.collect()`` plus a Python loop.
 
         Per-row vs constant fields:
-            * ``response_id_column``, ``observed_column``, ``field_column``
-              — column names in ``df`` that hold the per-row values. Pass
-              the *column name* as a string. None means the column isn't
-              in the DataFrame; the corresponding record field will be None
-              (or pulled from the constant ``field`` arg).
-            * ``rule``, ``event_type``, ``expected``, ``message``,
-              ``stack_trace``, and (constant) ``field`` — the same value
-              applied to every row.
+            Per-row (must be DataFrame columns):
+                ``response_id_column``, ``observed_column``,
+                and optionally ``variable_name_column``.
+            Constant for the whole call:
+                ``rule``, ``event_type``, ``expected``, ``message``,
+                ``stack_trace``, and (constant) ``variable_name``.
+
+        Variable-name shapes:
+            * Pass ``variable_name="dob_year"`` when the whole DataFrame
+              is one-variable-at-a-time validation. Every record has the
+              same ``variable_name``.
+            * Pass ``variable_name_column="variable"`` when the DataFrame
+              spans multiple variables — each row says which variable
+              failed in its own column.
+            Pass exactly one of these. Passing both is a programming error.
 
         Args:
             df: PySpark DataFrame containing one row per failure.
             rule: Validation rule key (must exist in the registry).
             event_type: Event category — same for every row.
-            field: Constant field name. Use either this OR ``field_column``,
-                not both. Useful when validation targets a single column and
-                the DataFrame doesn't carry that name.
-            expected: Constant expected value/pattern.
+            variable_name: Constant variable name. Mutually exclusive with
+                ``variable_name_column``.
+            variable_name_column: DataFrame column holding the variable
+                name (when validation spans multiple variables).
+            expected: Constant expected value/pattern. Same for every row.
+                Per-row expected values are not supported in this call —
+                if you need them, split into multiple ``log_dataframe()``
+                calls per (rule, expected) combination.
             response_id_column: DataFrame column holding response_id values.
+                Required — DataFrame validation is row-scoped by definition.
             observed_column: DataFrame column holding the observed values.
-            field_column: DataFrame column holding the field name (when
-                validation spans multiple columns and each row says which
-                one failed). Mutually exclusive with ``field``.
+                Required, same reasoning.
             message: Constant override for the human message.
             stack_trace: Constant stack trace.
 
@@ -377,28 +364,26 @@ class ExceptionLogger(BaseLogger):
             The number of records appended to the buffer.
 
         Raises:
-            ValueError: if both ``field`` and ``field_column`` are
-                supplied, if a referenced column doesn't exist in ``df``,
-                or if the DataFrame exceeds the safety size limit.
+            ValueError: if both ``variable_name`` and ``variable_name_column``
+                are supplied, if a referenced column doesn't exist in
+                ``df``, or if the DataFrame exceeds the safety size limit.
 
         Performance note:
-            This method calls ``df.count()`` then ``df.collect()`` —
-            driver-side iteration. Safe for failure DataFrames up to
-            ~100k rows; raises on larger inputs to protect driver memory.
-            Filter your DataFrame to actual failures before passing it in.
+            Calls ``df.count()`` then ``df.collect()`` — driver-side
+            iteration. Safe for failure DataFrames up to ~100k rows; raises
+            on larger inputs to protect driver memory. Filter your
+            DataFrame to actual failures before passing it in.
         """
-        if field is not None and field_column is not None:
+        if variable_name is not None and variable_name_column is not None:
             raise ValueError(
-                "Pass either `field` (constant) or `field_column` (per-row), "
-                "not both."
+                "Pass either `variable_name` (constant) or "
+                "`variable_name_column` (per-row), not both."
             )
 
-        # Validate that every named column exists in the DataFrame. This
-        # prevents typos from silently producing all-NULL columns later.
         for arg_name, col_name in [
             ("response_id_column", response_id_column),
             ("observed_column", observed_column),
-            ("field_column", field_column),
+            ("variable_name_column", variable_name_column),
         ]:
             if col_name is not None and col_name not in df.columns:
                 raise ValueError(
@@ -412,14 +397,8 @@ class ExceptionLogger(BaseLogger):
 
         # Resolve registry metadata once — same for every row.
         resolved = self._registry.resolve(rule)
-
-        # One timestamp per call. All rows logged together share it, so
-        # operators can find "all exceptions from this validation pass"
-        # by timestamp regardless of how many rows there were.
         timestamp = datetime.now(timezone.utc)
 
-        # collect() returns Row objects; row.asDict() converts each to a
-        # plain Python dict that we can index by column name.
         rows = df.collect()
         for row in rows:
             row_dict = row.asDict()
@@ -427,16 +406,14 @@ class ExceptionLogger(BaseLogger):
                 resolved=resolved,
                 event_type=event_type,
                 rule=rule,
-                field=(
-                    row_dict[field_column] if field_column else field
+                variable_name=(
+                    row_dict[variable_name_column]
+                    if variable_name_column
+                    else variable_name
                 ),
                 expected=expected,
-                observed=(
-                    row_dict[observed_column] if observed_column else None
-                ),
-                response_id=(
-                    row_dict[response_id_column] if response_id_column else None
-                ),
+                observed=row_dict[observed_column],
+                response_id=row_dict[response_id_column],
                 message=message,
                 stack_trace=stack_trace,
                 timestamp=timestamp,
@@ -455,7 +432,7 @@ class ExceptionLogger(BaseLogger):
         resolved: ResolvedCode,
         event_type: str,
         rule: str,
-        field: Optional[str],
+        variable_name: Optional[str],
         expected: Any,
         observed: Any,
         response_id: Optional[str],
@@ -466,8 +443,9 @@ class ExceptionLogger(BaseLogger):
         """
         Assemble one Delta-ready record dict. Pure function — no side effects.
 
-        Uses ``self._context_fields()`` (from BaseLogger) for the context
-        columns, then adds exception-specific fields on top.
+        Auto-generates the human message when ``message`` is None.
+        ``expected`` and ``observed`` go through ``_to_loggable`` so they
+        land in the table as queryable strings.
         """
         if message is None:
             message = (
@@ -476,15 +454,17 @@ class ExceptionLogger(BaseLogger):
             )
 
         return {
-            **self._context_fields(),  # run_id, task_key, source/target_table, collection_instance_id
+            **self._context_fields(),
             "observation_id": str(uuid.uuid4()),
             "validation_level": resolved.validation_level.value,
             "event_type": event_type,
             "error_code": resolved.error_code,
             "severity": resolved.severity.value,
             "message": message,
+            "expected": _to_loggable(expected),
+            "observed": _to_loggable(observed),
             "response_id": response_id,
-            "variable_name": field,
+            "variable_name": variable_name,
             "is_blocking": resolved.is_blocking,
             "stack_trace": stack_trace,
             "created_timestamp_utc": timestamp,
